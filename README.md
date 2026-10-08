@@ -2,7 +2,9 @@
 
 A Carbon/Oxide plugin for finding out why a Rust server lags.
 
-It runs inside the server and watches every frame. When a frame is slow (a "spike"), it
+It runs inside the server and watches every frame. Since 0.4.0 it also reaches the part of the frame that
+has no name in any plugin: Unity's own player-loop systems, every script `Update`, and the components
+that feed a busy engine system. When a frame is slow (a "spike"), it
 records what was running in that frame: game methods, plugin hooks, plugin timers, garbage
 collection, and which entities were spawned or killed. It also keeps a per-second timeline
 of where the server's time went, and can time individual plugins, game methods and entity
@@ -32,6 +34,9 @@ All commands work from the server console and RCON. In the F1 console they need 
 | `perfprobe.top [count]` | Totals since the last reset: what took the most time inside spike frames, what costs the most per minute overall, and which entities were spawned during spikes. |
 | `perfprobe.spawns [count]` | Entity churn: which prefabs are spawned and killed, per minute. |
 | `perfprobe.spawncost [count] [name]` | What each prefab costs to create, spawn and kill, in ms per minute and per call. Add part of a name to filter, e.g. `perfprobe.spawncost peacekeeper`. |
+| `perfprobe.loop [seconds] [top]` | Times every Unity player-loop system (physics, navmesh, animation constraints, the script phases...) and prints ms per second and the worst single call for each, with a hint on what to run next for anything busy. With no arguments: the last snapshot (one is taken automatically every `LoopSnapshotMinutes`). **Run this first on a new map or host.** |
+| `perfprobe.behaviours [seconds] [top] [filter]` | Stopwatches every `Update`, `LateUpdate` and `FixedUpdate` declared by any MonoBehaviour (game, framework, plugins) and prints the busiest. Names the script behind a busy script phase. `filter` limits it to type names containing the text. |
+| `perfprobe.components <Type> [Type...]` | Counts live Unity components of a type (e.g. `NavMeshObstacle`, `RotationConstraint`): total, enabled, on active objects, carving, and the prefabs and objects that carry them, with a `[collider]` flag. Turns "this engine system is busy" into "these prefabs feed it". 1-40 ms per type on a big map. |
 | `perfprobe.entities [count]` | How many entities of each prefab exist now, player-owned and not. **Loops over every entity in one frame (100–150ms on a big map): avoid while players are on.** |
 | `perfprobe.watch Type.Method` | Start timing a game method, e.g. `perfprobe.watch BaseOven.Cook`. `Type.*` times all methods of a type. |
 | `perfprobe.unwatch Type.Method` | Stop timing it. `Type.*` or `all` also work. |
@@ -95,6 +100,25 @@ Each watched call costs about 0.3 microseconds, so avoid watching methods that r
 thousands of times a second (per-entity update methods, for example). To watch something
 permanently, add it to `WatchOnStartup` in the config.
 
+### "The spike is not in any hook, timer or watched method"
+
+Half of a server frame can sit in Unity engine systems that no plugin profiler sees.
+
+1. Run `perfprobe.loop 30`. It prints every player-loop system with ms per second and the worst single
+   call. The phases (`Update`, `PreLateUpdate`, `FixedUpdate`...) contain their children, so read the
+   "systems by total" list. A hint line (`=>`) appears under anything known to be worth chasing.
+2. If an engine system is busy, run the `perfprobe.components` it suggests. Example from a 4500 map with
+   135,000 entities: `AIUpdatePostScript` at 207 ms/s was 10,500 `NavMeshObstacle` carvers on loot barrels
+   and crates, carving a Unity navmesh that a `-useNewNavmesh` server never builds; switching them off
+   took the server from 113 to 161 fps. `ConstraintManagerUpdate` at 115 ms/s was 180 `RotationConstraint`s
+   on the hoof pads of 45 horses, a client rig the server evaluated every frame; off, 162 to 206 fps.
+3. If a script phase is busy (`ScriptRunBehaviourUpdate`, `ScriptRunBehaviourLateUpdate`) or shows calls
+   over 20 ms, run `perfprobe.behaviours 30`. It names the script. The once-a-second 55 ms frame on the same
+   server was a plugin's `Update` walking every entity; the behaviours list showed it in one line.
+4. `perfprobe.loop` with no arguments shows the last automatic snapshot, and `loop-YYYY-MM-DD.csv` holds
+   one every few minutes, so a cost that only appears at certain times (a herd spawning, an event) shows up
+   without anyone watching.
+
 ### "Garbage collection pauses"
 
 `perfprobe.spikes` marks frames with a collection (`GC g0+1...`) and shows the heap size. The
@@ -130,6 +154,8 @@ In the server's data folder, under `PerfProbe/`:
 
 - `timeline-YYYY-MM-DD.csv`: one row per second, with the columns described above.
 - `players-YYYY-MM-DD.csv`: player samples.
+- `loop-YYYY-MM-DD.csv`: the top player-loop systems from each automatic snapshot (time, seconds, system,
+  ms_per_s, max_ms, over20ms).
 
 Previous days' files are gzipped, and files older than `CsvRetentionDays` are deleted.
 Every spike is also written to the plugin's log file (`spikes`) in the server's logs folder.
@@ -153,6 +179,8 @@ Every spike is also written to the plugin's log file (`spikes`) in the server's 
 | `MaxPlayersPerSample` | 150 | Cap on players per sample. |
 | `WriteCsv` | true | Write the timeline and player samples to CSV files. |
 | `CsvRetentionDays` | 7 | How long CSV files are kept. |
+| `LoopSnapshotMinutes` | 5 | How often the player loop is timed for one second and the top systems kept (status, `perfprobe.loop`, loop CSV). 0 turns it off. |
+| `LoopSnapshotTop` | 8 | How many systems each snapshot keeps. |
 
 ## Overhead and safety
 
@@ -162,4 +190,7 @@ Every spike is also written to the plugin's log file (`spikes`) in the server's 
   dropped and the game carries on.
 - Unloading the plugin removes every patch it made.
 - `perfprobe.entities` and `perfprobe.watch` on very busy methods are the only things that cost
-  noticeably; both are opt-in.
+  noticeably; both are opt-in. The loop snapshot adds ~170 stopwatch calls per frame for one second every
+  `LoopSnapshotMinutes`. `perfprobe.behaviours` patches a few hundred methods for its window and unpatches
+  them after; `perfprobe.loop` swaps the player loop in for its window and restores it after (and on
+  unload).

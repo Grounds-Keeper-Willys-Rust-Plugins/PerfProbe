@@ -11,12 +11,13 @@ using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Plugins;
 using UnityEngine;
+using UnityEngine.LowLevel;
 using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.3.0")]
-    [Description("Server performance probe: records frame spikes and what ran during them, plus a per-second timeline of where main-thread time went and what players were doing.")]
+    [Info("PerfProbe", "LucienAI", "0.4.0")]
+    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab.")]
     public class PerfProbe : RustPlugin
     {
         private const string HarmonyId = "com.lucienmp.perfprobe";
@@ -54,6 +55,11 @@ namespace Oxide.Plugins
             public int MaxPlayersPerSample = 150;
             public bool WriteCsv = true;
             public int CsvRetentionDays = 7;
+
+            // 0.4.0: every N minutes the Unity player loop is timed for one second and the top systems are kept
+            // (perfprobe.status, perfprobe.loop with no arguments, loop-YYYY-MM-DD.csv). 0 = off.
+            public int LoopSnapshotMinutes = 5;
+            public int LoopSnapshotTop = 8;
         }
 
         private static List<string> DefaultWatchList() => new List<string>
@@ -107,6 +113,8 @@ namespace Oxide.Plugins
             _config.PlayerSampleSeconds = Mathf.Clamp(_config.PlayerSampleSeconds, 1, 300);
             _config.MaxPlayersPerSample = Mathf.Clamp(_config.MaxPlayersPerSample, 1, 500);
             _config.CsvRetentionDays = Mathf.Max(1, _config.CsvRetentionDays);
+            _config.LoopSnapshotMinutes = Mathf.Clamp(_config.LoopSnapshotMinutes, 0, 24 * 60);
+            _config.LoopSnapshotTop = Mathf.Clamp(_config.LoopSnapshotTop, 3, 40);
             SaveConfig();
         }
 
@@ -157,12 +165,14 @@ namespace Oxide.Plugins
             _host = new GameObject("PerfProbe");
             _host.AddComponent<FrameWatcher>();
             Probe.Active = true;
+            Engine.Init(this, _config);
             Puts($"Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline {(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}. " +
                  "Use perfprobe.status / perfprobe.top / perfprobe.spikes / perfprobe.timeline.");
         }
 
         private void Unload()
         {
+            Engine.Shutdown();
             Probe.Active = false;
             if (_host != null)
                 UnityEngine.Object.Destroy(_host);
@@ -212,7 +222,7 @@ namespace Oxide.Plugins
         private void CmdStatus(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
-            arg.ReplyWith(Probe.Status() + "\n" + Timeline.Status());
+            arg.ReplyWith(Probe.Status() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
         [ConsoleCommand("perfprobe.spikes")]
@@ -355,6 +365,36 @@ namespace Oxide.Plugins
             if (!Allowed(arg)) return;
             string mode = arg.GetString(0, string.Empty).ToLowerInvariant();
             arg.ReplyWith(TimerDoctor.Run(plugins.GetAll(), mode == "fix" || mode == "fixall", mode == "fixall"));
+        }
+
+        // perfprobe.loop [seconds] [top]: time every Unity player-loop system (physics, navmesh, constraints, script
+        // phases...) for a while and print ms per second and the worst single call. No arguments: the last snapshot.
+        [ConsoleCommand("perfprobe.loop")]
+        private void CmdLoop(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (!arg.HasArgs(1)) { arg.ReplyWith(Engine.LastSnapshotText()); return; }
+            arg.ReplyWith(Engine.LoopStart(Mathf.Clamp(arg.GetInt(0, 30), 2, 600), arg.GetInt(1, 30), manual: true));
+        }
+
+        // perfprobe.behaviours [seconds] [top] [filter]: stopwatch every Update / LateUpdate / FixedUpdate declared by a
+        // MonoBehaviour in any loaded assembly, to name the script behind a busy script phase
+        [ConsoleCommand("perfprobe.behaviours")]
+        private void CmdBehaviours(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            arg.ReplyWith(Engine.BehavioursStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
+        }
+
+        // perfprobe.components <Type> [Type...]: live Unity components of a type, by owning prefab and object
+        [ConsoleCommand("perfprobe.components")]
+        private void CmdComponents(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (!arg.HasArgs(1)) { arg.ReplyWith("Usage: perfprobe.components <TypeName> [TypeName...]  e.g. perfprobe.components NavMeshObstacle RotationConstraint"); return; }
+            var names = new List<string>();
+            for (int i = 0; arg.HasArgs(i + 1); i++) names.Add(arg.GetString(i, string.Empty));
+            arg.ReplyWith(Engine.Components(names));
         }
 
         [ConsoleCommand("perfprobe.reset")]
@@ -1430,6 +1470,351 @@ namespace Oxide.Plugins
 
         #endregion
 
+
+        #region Engine probes
+
+        // 0.4.0. Everything above times things with names: hooks, timers, invokes, watched methods. These three probes
+        // reach the rest of the frame.
+        //   Loop: the Unity player loop (PlayerLoop API) with a stopwatch delegate inserted before and after every
+        //         system. It attributes engine work no script owns: physics, navmesh obstacle carving (AIUpdatePostScript),
+        //         animation constraints (ConstraintManagerUpdate), and the script phases as a whole.
+        //   Behaviours: a Harmony stopwatch on every Update/LateUpdate/FixedUpdate declared by any MonoBehaviour, to name
+        //         the script behind a busy script phase.
+        //   Components: live components of a Unity type, grouped by the entity prefab and object they sit on, so a busy
+        //         engine system can be traced to what feeds it (10,500 NavMeshObstacles on loot barrels; 180
+        //         RotationConstraints on horse hoof pads, in the first use).
+        // A one-second loop snapshot runs every LoopSnapshotMinutes and is kept for perfprobe.status and loop-<day>.csv.
+        private static class Engine
+        {
+            private static PerfProbe _plugin;
+            private static PluginConfig _cfg;
+
+            public static void Init(PerfProbe plugin, PluginConfig config)
+            {
+                _plugin = plugin; _cfg = config;
+                if (config.LoopSnapshotMinutes > 0)
+                {
+                    _snapshotTimer = plugin.timer.Every(config.LoopSnapshotMinutes * 60f, () => LoopStart(1, config.LoopSnapshotTop, manual: false));
+                    plugin.timer.Once(20f, () => LoopStart(1, config.LoopSnapshotTop, manual: false));   // a first look soon after load
+                }
+            }
+
+            public static void Shutdown()
+            {
+                _snapshotTimer?.Destroy(); _snapshotTimer = null;
+                _loopTimer?.Destroy(); _loopTimer = null;
+                if (_loopActive) LoopRestore();
+                _behTimer?.Destroy(); _behTimer = null;
+                if (_behHarmony != null) BehavioursStop(0, false);
+                _plugin = null;
+            }
+
+            #region Player loop
+
+            private class LoopMarker { }
+            private class LoopStat { public string Name; public int Depth; public Stopwatch Sw = new Stopwatch(); public double TotalMs, MaxMs; public int Calls, Over20; }
+            private static List<LoopStat> _loopStats;
+            private static PlayerLoopSystem _loopOrig;
+            private static bool _loopActive, _loopManual;
+            private static float _loopStart;
+            private static Timer _loopTimer, _snapshotTimer;
+
+            // last snapshot (manual or periodic), for status and perfprobe.loop with no arguments
+            public class LoopLine { public string Name; public double MsPerSecond, MaxMs; public int Over20; }
+            private static readonly List<LoopLine> _lastSnapshot = new List<LoopLine>();
+            private static DateTime _lastSnapshotAt;
+            private static float _lastSnapshotSeconds;
+
+            public static string LoopStart(int seconds, int top, bool manual)
+            {
+                if (_loopActive) return manual ? "Loop probe already running" : string.Empty;
+                if (_plugin == null) return "PerfProbe not initialised";
+                _loopStats = new List<LoopStat>();
+                try
+                {
+                    _loopOrig = PlayerLoop.GetCurrentPlayerLoop();
+                    PlayerLoop.SetPlayerLoop(LoopWrap(_loopOrig, string.Empty, 0));
+                }
+                catch (Exception e) { return "Loop probe failed to install: " + e.Message; }
+                _loopActive = true; _loopManual = manual; _loopStart = Time.realtimeSinceStartup;
+                _loopTimer = _plugin.timer.Once(seconds, () => LoopReport(top));
+                return $"Loop probe: timing {_loopStats.Count} player-loop systems for {seconds}s; the result prints to the console";
+            }
+
+            private static PlayerLoopSystem LoopWrap(PlayerLoopSystem sys, string prefix, int depth)
+            {
+                var copy = sys;
+                if (sys.subSystemList == null || sys.subSystemList.Length == 0) return copy;
+                var list = new List<PlayerLoopSystem>(sys.subSystemList.Length * 3);
+                foreach (var child in sys.subSystemList)
+                {
+                    string name = prefix + (child.type != null ? child.type.Name : "?");
+                    var st = new LoopStat { Name = name, Depth = depth };
+                    _loopStats.Add(st);
+                    list.Add(new PlayerLoopSystem { type = typeof(LoopMarker), updateDelegate = () => st.Sw.Restart() });
+                    list.Add(child.subSystemList != null && child.subSystemList.Length > 0 ? LoopWrap(child, name + ".", depth + 1) : child);
+                    list.Add(new PlayerLoopSystem { type = typeof(LoopMarker), updateDelegate = () =>
+                    {
+                        st.Sw.Stop();
+                        double ms = st.Sw.Elapsed.TotalMilliseconds;
+                        st.TotalMs += ms; st.Calls++;
+                        if (ms > st.MaxMs) st.MaxMs = ms;
+                        if (ms > 20) st.Over20++;
+                    } });
+                }
+                copy.subSystemList = list.ToArray();
+                return copy;
+            }
+
+            private static void LoopRestore()
+            {
+                try { PlayerLoop.SetPlayerLoop(_loopOrig); }
+                catch (Exception e) { _plugin?.PrintError("Restoring the player loop failed: " + e.Message); }
+                _loopActive = false;
+            }
+
+            private static void LoopReport(int top)
+            {
+                if (!_loopActive) return;
+                float secs = Math.Max(0.001f, Time.realtimeSinceStartup - _loopStart);
+                LoopRestore();
+                _loopTimer = null;
+
+                _lastSnapshot.Clear();
+                foreach (var st in _loopStats.Where(x => x.Depth > 0 && x.Calls > 0).OrderByDescending(x => x.TotalMs).Take(Math.Max(top, _cfg.LoopSnapshotTop)))
+                    _lastSnapshot.Add(new LoopLine { Name = st.Name, MsPerSecond = st.TotalMs / secs, MaxMs = st.MaxMs, Over20 = st.Over20 });
+                _lastSnapshotAt = DateTime.UtcNow; _lastSnapshotSeconds = secs;
+                WriteLoopCsv();
+
+                if (!_loopManual) return;
+                var sb = new StringBuilder($"[PerfProbe] player loop over {secs:0}s, ms per second of wall time (a phase contains its children):\n");
+                foreach (var st in _loopStats.Where(x => x.Depth == 0))
+                    sb.Append($"  {st.TotalMs / secs,8:F1} ms/s {st.Calls / secs,7:F0}/s  max {st.MaxMs,6:F1} ms  >20ms {st.Over20,4}  {st.Name}\n");
+                sb.Append("  -- systems by total:\n");
+                foreach (var st in _loopStats.Where(x => x.Depth > 0).OrderByDescending(x => x.TotalMs).Take(top))
+                    sb.Append($"  {st.TotalMs / secs,8:F1} ms/s {st.Calls / secs,7:F0}/s  max {st.MaxMs,6:F1} ms  >20ms {st.Over20,4}  {st.Name}\n");
+                sb.Append("  -- systems by worst single call:\n");
+                foreach (var st in _loopStats.Where(x => x.Depth > 0 && x.MaxMs >= 5).OrderByDescending(x => x.MaxMs).Take(10))
+                    sb.Append($"  max {st.MaxMs,6:F1} ms  >20ms {st.Over20,4}  {st.TotalMs / secs,8:F1} ms/s  {st.Name}\n");
+                foreach (var hint in Hints(_lastSnapshot)) sb.Append("  => " + hint + "\n");
+                _plugin.Puts(sb.ToString().TrimEnd());
+            }
+
+            public static string LastSnapshotText()
+            {
+                if (_lastSnapshot.Count == 0) return "No loop snapshot yet. perfprobe.loop <seconds> runs one now" + (_cfg != null && _cfg.LoopSnapshotMinutes > 0 ? $"; one is taken every {_cfg.LoopSnapshotMinutes} min" : string.Empty);
+                var sb = new StringBuilder($"Player loop snapshot at {_lastSnapshotAt:HH:mm:ss} UTC ({_lastSnapshotSeconds:0}s), ms per second:\n");
+                foreach (var l in _lastSnapshot) sb.Append($"  {l.MsPerSecond,8:F1} ms/s  max {l.MaxMs,6:F1} ms  {l.Name}\n");
+                foreach (var hint in Hints(_lastSnapshot)) sb.Append("  => " + hint + "\n");
+                return sb.ToString().TrimEnd();
+            }
+
+            // For perfprobe.status: the top five of the last snapshot and what to run next
+            public static string StatusSuffix()
+            {
+                if (_lastSnapshot.Count == 0) return string.Empty;
+                var sb = new StringBuilder($"\nPlayer loop ({_lastSnapshotAt:HH:mm} UTC): ");
+                sb.Append(string.Join(", ", _lastSnapshot.Take(5).Select(l => $"{ShortName(l.Name)} {l.MsPerSecond:0}ms/s")));
+                foreach (var hint in Hints(_lastSnapshot)) sb.Append("\n  => " + hint);
+                return sb.ToString();
+            }
+
+            private static string ShortName(string name) { int i = name.LastIndexOf('.'); return i >= 0 ? name.Substring(i + 1) : name; }
+
+            // Which engine systems point at which components. Thresholds are ms per second of main-thread time.
+            private struct Hint { public string System; public double MinMsPerSecond; public string Text; }
+            private static readonly Hint[] HintTable =
+            {
+                new Hint { System = "AIUpdatePostScript", MinMsPerSecond = 20, Text = "Unity navmesh work (obstacle carving, crowd): perfprobe.components NavMeshObstacle NavMeshAgent. On a -useNewNavmesh server the obstacles carve a navmesh that is never built; NavCompat 0.2.0 switches them off" },
+                new Hint { System = "ConstraintManagerUpdate", MinMsPerSecond = 10, Text = "Unity animation constraints: perfprobe.components RotationConstraint ParentConstraint PositionConstraint AimConstraint LookAtConstraint ScaleConstraint. A server never reads a visual rig; ServerTrim switches them off by prefab" },
+                new Hint { System = "ScriptRunBehaviourLateUpdate", MinMsPerSecond = 60, Text = "script LateUpdate: perfprobe.behaviours 30 names the scripts" },
+                new Hint { System = "PhysicsFixedUpdate", MinMsPerSecond = 150, Text = "PhysX step: physics.print_colliders_per_prefab shows what the colliders are" },
+                new Hint { System = "ScriptRunDelayedDynamicFrameRate", MinMsPerSecond = 30, Text = "coroutines (yield null / WaitForSeconds): no profiler names them; look for plugin coroutines doing bulk work" },
+                new Hint { System = "DirectorUpdate", MinMsPerSecond = 10, Text = "Unity Timeline/Playable directors: perfprobe.components PlayableDirector" },
+                new Hint { System = "LegacyAnimationUpdate", MinMsPerSecond = 10, Text = "legacy Animation components: perfprobe.components Animation" },
+            };
+
+            private static IEnumerable<string> Hints(List<LoopLine> lines)
+            {
+                foreach (var h in HintTable)
+                {
+                    var l = lines.FirstOrDefault(x => x.Name.EndsWith(h.System, StringComparison.Ordinal));
+                    if (l != null && l.MsPerSecond >= h.MinMsPerSecond) yield return $"{h.System} {l.MsPerSecond:0} ms/s: {h.Text}";
+                }
+                var upd = lines.FirstOrDefault(x => x.Name.EndsWith("ScriptRunBehaviourUpdate", StringComparison.Ordinal));
+                if (upd != null && upd.Over20 > 0) yield return $"ScriptRunBehaviourUpdate had {upd.Over20} call(s) over 20 ms: a script Update spikes; perfprobe.behaviours 30 names it, perfprobe.spikes shows what else was in those frames";
+            }
+
+            private static StreamWriter _loopWriter; private static string _loopDay;
+
+            private static void WriteLoopCsv()
+            {
+                string dir = Timeline.Dir;
+                if (dir == null || _lastSnapshot.Count == 0) return;
+                try
+                {
+                    string day = DateTime.UtcNow.ToString("yyyy-MM-dd");
+                    if (_loopWriter == null || day != _loopDay)
+                    {
+                        try { _loopWriter?.Dispose(); } catch { }
+                        string path = Path.Combine(dir, $"loop-{day}.csv");
+                        bool exists = File.Exists(path);
+                        _loopWriter = new StreamWriter(path, true, new UTF8Encoding(false), 16 * 1024);
+                        if (!exists) _loopWriter.WriteLine("time,seconds,system,ms_per_s,max_ms,over20ms");
+                        _loopDay = day;
+                    }
+                    var ci = CultureInfo.InvariantCulture;
+                    long t = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    foreach (var l in _lastSnapshot.Take(_cfg.LoopSnapshotTop))
+                        _loopWriter.WriteLine(string.Join(",", t.ToString(ci), _lastSnapshotSeconds.ToString("0", ci), l.Name, l.MsPerSecond.ToString("0.00", ci), l.MaxMs.ToString("0.00", ci), l.Over20.ToString(ci)));
+                    _loopWriter.Flush();
+                }
+                catch (Exception e)
+                {
+                    try { _loopWriter?.Dispose(); } catch { }
+                    _loopWriter = null;
+                    _plugin?.PrintWarning("Loop CSV disabled after write error: " + e.Message);
+                }
+            }
+
+            #endregion
+
+            #region Behaviours
+
+            private class BehStat { public string Name; public long Ticks, MaxTicks; public int Calls, Over20; }
+            private static readonly Dictionary<MethodBase, BehStat> _beh = new Dictionary<MethodBase, BehStat>();
+            private static Harmony _behHarmony; private static Timer _behTimer; private static float _behStart;
+            private static readonly string[] BehNames = { "Update", "LateUpdate", "FixedUpdate" };
+            private const string BehHarmonyId = HarmonyId + ".behaviours";
+
+            public static string BehavioursStart(int seconds, int top, string filter)
+            {
+                if (_behHarmony != null) return "Behaviour probe already running";
+                if (_plugin == null) return "PerfProbe not initialised";
+                _beh.Clear();
+                _behHarmony = new Harmony(BehHarmonyId);
+                var pre = new HarmonyMethod(typeof(Engine), nameof(BehPrefix));
+                var post = new HarmonyMethod(typeof(Engine), nameof(BehPostfix));
+                int patched = 0, failed = 0, types = 0;
+                var sw = Stopwatch.StartNew();
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Type[] all;
+                    try { all = asm.GetTypes(); }
+                    catch (ReflectionTypeLoadException e) { all = e.Types.Where(t => t != null).ToArray(); }
+                    catch { continue; }
+                    foreach (var t in all)
+                    {
+                        // every check is guarded: a type whose dependencies are missing throws from IsAssignableFrom (MySqlX on Carbon).
+                        // Abstract bases are included: FacepunchBehaviour-style bases declare the Update their subclasses run.
+                        bool isMb;
+                        try { isMb = t != null && !t.IsGenericTypeDefinition && typeof(MonoBehaviour).IsAssignableFrom(t); } catch { continue; }
+                        if (!isMb) continue;
+                        if (filter.Length > 0 && t.FullName.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        bool any = false;
+                        foreach (var name in BehNames)
+                        {
+                            MethodInfo m;
+                            try
+                            {
+                                m = t.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
+                                if (m == null || m.IsAbstract || m.GetMethodBody() == null) continue;
+                            }
+                            catch { continue; }
+                            try { _behHarmony.Patch(m, pre, post); _beh[m] = new BehStat { Name = t.FullName + "." + name }; patched++; any = true; }
+                            catch { failed++; }
+                        }
+                        if (any) types++;
+                    }
+                }
+                _behStart = Time.realtimeSinceStartup;
+                _behTimer = _plugin.timer.Once(seconds, () => BehavioursStop(top, true));
+                return $"Behaviour probe: {patched} methods on {types} MonoBehaviour types patched in {sw.ElapsedMilliseconds}ms ({failed} failed) for {seconds}s; the result prints to the console";
+            }
+
+            private static void BehPrefix(out long __state) { __state = Stopwatch.GetTimestamp(); }
+
+            private static void BehPostfix(long __state, MethodBase __originalMethod)
+            {
+                BehStat st;
+                if (!_beh.TryGetValue(__originalMethod, out st)) return;
+                long t = Stopwatch.GetTimestamp() - __state;
+                st.Ticks += t; st.Calls++;
+                if (t > st.MaxTicks) st.MaxTicks = t;
+                if (t > Stopwatch.Frequency / 50) st.Over20++;
+            }
+
+            private static void BehavioursStop(int top, bool report)
+            {
+                float secs = Math.Max(0.001f, Time.realtimeSinceStartup - _behStart);
+                try { _behHarmony?.UnpatchAll(BehHarmonyId); } catch (Exception e) { _plugin?.PrintError("Behaviour probe unpatch failed: " + e.Message); }
+                _behHarmony = null; _behTimer = null;
+                if (!report || _plugin == null) return;
+                double ms = 1000.0 / Stopwatch.Frequency;
+                var sb = new StringBuilder($"[PerfProbe] script Update/LateUpdate/FixedUpdate over {secs:0}s, {_beh.Count} methods timed:\n");
+                foreach (var st in _beh.Values.Where(x => x.Calls > 0).OrderByDescending(x => x.Ticks).Take(top))
+                    sb.Append($"  {st.Ticks * ms / secs,8:F2} ms/s {st.Calls / secs,7:F0}/s  max {st.MaxTicks * ms,6:F1} ms  >20ms {st.Over20,4}  {st.Name}\n");
+                sb.Append("  -- by worst single call:\n");
+                foreach (var st in _beh.Values.Where(x => x.MaxTicks * ms >= 5).OrderByDescending(x => x.MaxTicks).Take(10))
+                    sb.Append($"  max {st.MaxTicks * ms,6:F1} ms  >20ms {st.Over20,4}  {st.Ticks * ms / secs,8:F2} ms/s  {st.Name}\n");
+                _plugin.Puts(sb.ToString().TrimEnd());
+            }
+
+            #endregion
+
+            #region Components
+
+            // Counts live components of a type (FindObjectsByType incl. inactive, 1-40 ms per type on a big scene),
+            // with enabled count, carving (NavMeshObstacle), and the prefabs and objects that carry them, plus a
+            // collider flag on the object, so a trim can be judged safe.
+            public static string Components(List<string> names)
+            {
+                var sb = new StringBuilder();
+                foreach (var name in names)
+                {
+                    Type type = null;
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        try { type = asm.GetTypes().FirstOrDefault(t => t.Name == name || t.FullName == name); } catch { }
+                        if (type != null) break;
+                    }
+                    if (type == null) { sb.Append($"{name}: type not found\n"); continue; }
+                    if (!typeof(UnityEngine.Object).IsAssignableFrom(type)) { sb.Append($"{type.FullName}: not a Unity object type\n"); continue; }
+                    var sw = Stopwatch.StartNew();
+                    UnityEngine.Object[] objs;
+                    try { objs = UnityEngine.Object.FindObjectsByType(type, FindObjectsInactive.Include, FindObjectsSortMode.None); }
+                    catch (Exception e) { sb.Append($"{type.FullName}: {e.Message}\n"); continue; }
+                    int enabled = 0, carving = 0, activeGo = 0;
+                    var carveProp = type.GetProperty("carving");
+                    var owners = new Dictionary<string, int>();
+                    var objects = new Dictionary<string, int>();
+                    foreach (var o in objs)
+                    {
+                        var b = o as Behaviour; if (b != null && b.enabled) enabled++;
+                        var c = o as Component;
+                        if (c != null)
+                        {
+                            if (c.gameObject.activeInHierarchy) activeGo++;
+                            var ent = c.GetComponentInParent<BaseEntity>();
+                            string owner = ent != null ? ent.ShortPrefabName : c.transform.root.name;
+                            int n; owners.TryGetValue(owner, out n); owners[owner] = n + 1;
+                            string oname = c.gameObject.name + (c.GetComponent<Collider>() != null ? " [collider]" : string.Empty);
+                            int m; objects.TryGetValue(oname, out m); objects[oname] = m + 1;
+                        }
+                        if (carveProp != null) { try { if ((bool)carveProp.GetValue(o)) carving++; } catch { } }
+                    }
+                    sb.Append($"{type.FullName}: {objs.Length} total, {enabled} enabled, {activeGo} on active objects{(carveProp != null ? $", {carving} carving" : string.Empty)} ({sw.ElapsedMilliseconds}ms to count)\n");
+                    if (owners.Count > 0) sb.Append("  prefabs: " + string.Join(", ", owners.OrderByDescending(kv => kv.Value).Take(8).Select(kv => $"{kv.Key} {kv.Value}")) + "\n");
+                    if (objects.Count > 0) sb.Append("  objects: " + string.Join(", ", objects.OrderByDescending(kv => kv.Value).Take(8).Select(kv => $"{kv.Key} {kv.Value}")) + "\n");
+                }
+                return sb.ToString().TrimEnd();
+            }
+
+            #endregion
+        }
+
+        #endregion
+
         #region Timeline
 
         // One row per second (aligned to Rust's own Performance sampling) plus player samples every few
@@ -1493,6 +1878,7 @@ namespace Oxide.Plugins
 
             // CSV output
             private static string _dir;
+            public static string Dir => _dir;
             private static StreamWriter _rowWriter, _playerWriter;
             private static string _fileDay;
             private static int _unflushed;
