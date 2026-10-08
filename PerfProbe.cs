@@ -16,7 +16,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.4.0")]
+    [Info("PerfProbe", "LucienAI", "0.4.1")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab.")]
     public class PerfProbe : RustPlugin
     {
@@ -1681,17 +1681,18 @@ namespace Oxide.Plugins
 
             #region Behaviours
 
-            private class BehStat { public string Name; public long Ticks, MaxTicks; public int Calls, Over20; }
+            private class BehStat { public string Name, Kind; public long Ticks, MaxTicks; public int Calls, Over20; }
             private static readonly Dictionary<MethodBase, BehStat> _beh = new Dictionary<MethodBase, BehStat>();
-            private static Harmony _behHarmony; private static Timer _behTimer; private static float _behStart;
+            private static Harmony _behHarmony; private static Timer _behTimer; private static float _behStart; private static int _behFrame0, _behFrames;
             private static readonly string[] BehNames = { "Update", "LateUpdate", "FixedUpdate" };
+            private static readonly List<string> _behFailed = new List<string>();
             private const string BehHarmonyId = HarmonyId + ".behaviours";
 
             public static string BehavioursStart(int seconds, int top, string filter)
             {
                 if (_behHarmony != null) return "Behaviour probe already running";
                 if (_plugin == null) return "PerfProbe not initialised";
-                _beh.Clear();
+                _beh.Clear(); _behFailed.Clear();
                 _behHarmony = new Harmony(BehHarmonyId);
                 var pre = new HarmonyMethod(typeof(Engine), nameof(BehPrefix));
                 var post = new HarmonyMethod(typeof(Engine), nameof(BehPostfix));
@@ -1718,18 +1719,29 @@ namespace Oxide.Plugins
                             try
                             {
                                 m = t.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
-                                if (m == null || m.IsAbstract || m.GetMethodBody() == null) continue;
+                                // 0.4.1: a method declared on a generic base (Base<T>.LateUpdate) is never declared on any
+                                // non-generic type, so it was skipped; take it from the closed base the type inherits
+                                if (m == null)
+                                {
+                                    var inh = t.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
+                                    // Harmony needs the method as declared on the closed base, not as reflected through the subclass.
+                                    // This is how the invoke scheduler (InvokeHandlerBase<T>.LateUpdate, which runs every Invoke
+                                    // callback on the server) gets timed.
+                                    if (inh != null && inh.DeclaringType != null && inh.DeclaringType.IsGenericType && !inh.DeclaringType.IsGenericTypeDefinition)
+                                        m = inh.DeclaringType.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
+                                }
+                                if (m == null || m.IsAbstract || m.GetMethodBody() == null || _beh.ContainsKey(m)) continue;
                             }
                             catch { continue; }
-                            try { _behHarmony.Patch(m, pre, post); _beh[m] = new BehStat { Name = t.FullName + "." + name }; patched++; any = true; }
-                            catch { failed++; }
+                            try { _behHarmony.Patch(m, pre, post); _beh[m] = new BehStat { Name = (m.DeclaringType != t ? m.DeclaringType.Name + " via " : string.Empty) + t.FullName + "." + name, Kind = name }; patched++; any = true; }
+                            catch (Exception e) { failed++; if (_behFailed.Count < 20) _behFailed.Add($"{t.FullName}.{name} ({e.GetType().Name}: {e.Message.Split('\n')[0]})"); }
                         }
                         if (any) types++;
                     }
                 }
-                _behStart = Time.realtimeSinceStartup;
+                _behStart = Time.realtimeSinceStartup; _behFrame0 = Time.frameCount;
                 _behTimer = _plugin.timer.Once(seconds, () => BehavioursStop(top, true));
-                return $"Behaviour probe: {patched} methods on {types} MonoBehaviour types patched in {sw.ElapsedMilliseconds}ms ({failed} failed) for {seconds}s; the result prints to the console";
+                return $"Behaviour probe: {patched} methods on {types} MonoBehaviour types patched in {sw.ElapsedMilliseconds}ms ({failed} failed{(_behFailed.Count > 0 ? ": " + string.Join("; ", _behFailed) : string.Empty)}) for {seconds}s; the result prints to the console";
             }
 
             private static void BehPrefix(out long __state) { __state = Stopwatch.GetTimestamp(); }
@@ -1747,13 +1759,29 @@ namespace Oxide.Plugins
             private static void BehavioursStop(int top, bool report)
             {
                 float secs = Math.Max(0.001f, Time.realtimeSinceStartup - _behStart);
+                _behFrames = Time.frameCount - _behFrame0;
                 try { _behHarmony?.UnpatchAll(BehHarmonyId); } catch (Exception e) { _plugin?.PrintError("Behaviour probe unpatch failed: " + e.Message); }
                 _behHarmony = null; _behTimer = null;
                 if (!report || _plugin == null) return;
                 double ms = 1000.0 / Stopwatch.Frequency;
                 var sb = new StringBuilder($"[PerfProbe] script Update/LateUpdate/FixedUpdate over {secs:0}s, {_beh.Count} methods timed:\n");
+                // 0.4.1: totals per kind. The loop probe's script phase minus this total is Unity's per-call dispatch
+                // (native to managed, once per component per frame), which no method timer can see: many cheap
+                // components show up as a large phase with nothing large inside it.
+                float fps = Math.Max(1f, _behFrames / secs);
+                foreach (var kind in BehNames)
+                {
+                    var ofKind = _beh.Values.Where(x => x.Kind == kind && x.Calls > 0).ToList();
+                    if (ofKind.Count == 0) continue;
+                    double kms = ofKind.Sum(x => x.Ticks) * ms / secs; double kcalls = ofKind.Sum(x => (double)x.Calls) / secs;
+                    double perFrame = kind == "FixedUpdate" ? kcalls / 16.0 : kcalls / fps;
+                    sb.Append($"  {kind}: {ofKind.Count} methods, {kms:F1} ms/s inside them, {kcalls:F0} calls/s (~{perFrame:F0} components per {(kind == "FixedUpdate" ? "fixed step" : "frame")})\n");
+                }
                 foreach (var st in _beh.Values.Where(x => x.Calls > 0).OrderByDescending(x => x.Ticks).Take(top))
                     sb.Append($"  {st.Ticks * ms / secs,8:F2} ms/s {st.Calls / secs,7:F0}/s  max {st.MaxTicks * ms,6:F1} ms  >20ms {st.Over20,4}  {st.Name}\n");
+                sb.Append("  -- most called (many cheap components cost dispatch time outside the methods):\n");
+                foreach (var st in _beh.Values.Where(x => x.Calls > 0).OrderByDescending(x => x.Calls).Take(Math.Min(top, 12)))
+                    sb.Append($"  {st.Calls / secs,8:F0}/s (~{st.Calls / secs / fps:F0} per frame)  {st.Ticks * ms / secs,7:F2} ms/s  {st.Name}\n");
                 sb.Append("  -- by worst single call:\n");
                 foreach (var st in _beh.Values.Where(x => x.MaxTicks * ms >= 5).OrderByDescending(x => x.MaxTicks).Take(10))
                     sb.Append($"  max {st.MaxTicks * ms,6:F1} ms  >20ms {st.Over20,4}  {st.Ticks * ms / secs,8:F2} ms/s  {st.Name}\n");
