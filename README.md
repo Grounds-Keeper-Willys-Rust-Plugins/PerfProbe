@@ -18,7 +18,9 @@ Everything is read through console commands (server console, F1 console as admin
 ## Install
 
 1. Copy `PerfProbe.cs` into the server's `plugins` folder (`carbon/plugins` or `oxide/plugins`).
-2. It loads straight away. The console shows what it is watching, for example
+2. It loads straight away and starts recording frames, then attaches its ~100 patches over the next few
+   seconds, at most 8 ms of patching per frame (`perfprobe.status` shows `Attaching: X of Y patch steps done`
+   until then, and `Attached in N s` prints at the end). The console shows what it is watching, for example
    `Watching 32 method(s)...`, `Timing plugin hooks for 33 plugin(s)` and
    `Timing entity create/spawn/kill per prefab via 4 method(s)`, `Timing 6 work queue(s)`,
    `Timing console commands via ConsoleSystem.RunWithResult`,
@@ -246,8 +248,9 @@ any entries you added.
   (well under 0.1% of one core).
 - All timing code is written never to throw inside game code: if a measurement fails, it is
   dropped and the game carries on.
-- Unloading the plugin removes every patch it made, all in one frame (~4 s on a 138k-entity server with ~100
-  patches). `perfprobe.detach` first removes them over several frames, so the unload is then instant.
+- Loading attaches the patches over several frames (0.5.4; before that, ~4 s in one frame on a 138k-entity
+  server). Unloading removes every patch it made, all in one frame (~4 s on the same server).
+  `perfprobe.detach` first removes them over several frames, so the unload is then instant.
 - `perfprobe.entities` and `perfprobe.watch` on very busy methods are the only things that cost
   noticeably; both are opt-in. The loop snapshot adds ~170 stopwatch calls per frame for one second every
   `LoopSnapshotMinutes`. `perfprobe.behaviours` patches a few hundred methods for its window and unpatches

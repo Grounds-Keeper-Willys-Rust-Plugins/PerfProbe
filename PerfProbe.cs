@@ -17,7 +17,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.3")]
+    [Info("PerfProbe", "LucienAI", "0.5.4")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
@@ -179,46 +179,6 @@ namespace Oxide.Plugins
             _harmony = new Harmony(HarmonyId);
             Probe.Harmony = _harmony;
 
-            if (_config.TimePluginTimers)
-                Puts(Probe.PatchTimers());
-
-            int watched = 0;
-            var missing = new List<string>();
-            foreach (var spec in _config.WatchOnStartup)
-            {
-                int count = Probe.WatchCount(spec, out string message);
-                watched += count;
-                if (count == 0) missing.Add(message);
-            }
-            Puts($"Watching {watched} method(s) from {_config.WatchOnStartup.Count} entries" +
-                 (missing.Count > 0 ? $"; skipped: {string.Join("; ", missing)}" : string.Empty));
-
-            if (_config.TimePluginHooks)
-            {
-                foreach (var plugin in plugins.GetAll())
-                    Probe.PatchPluginHooks(plugin);
-                Puts($"Timing plugin hooks for {Probe.HookPatchedCount} plugin(s)" +
-                     (Probe.HookPatchFailures > 0 ? $", {Probe.HookPatchFailures} could not be patched" : string.Empty));
-            }
-
-            if (_config.TimeEntityCosts)
-                Puts(Probe.PatchEntityCosts());
-
-            if (_config.WatchWorkQueues)
-                Puts(Probe.WatchWorkQueues());
-
-            if (_config.TimeConsoleCommands)
-                Puts(Probe.PatchConsoleCommands());
-
-            if (_config.TrackNetwork)
-                Puts(NetProbe.Patch(_harmony));
-
-            if (_config.TimeRpcs)
-                Puts(Calls.PatchRpcs(_harmony));
-
-            if (_config.ClientPerfReports)
-                Puts(Clients.Patch(this, _harmony, _config.PlayerSampleSeconds));
-
             if (_config.TimelineEnabled)
                 Timeline.Init(_config);
 
@@ -227,8 +187,60 @@ namespace Oxide.Plugins
             Probe.Active = true;
             Engine.Init(this, _config);
             Calls.Init(this, watcher);
-            Puts($"Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline {(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}. " +
-                 "Use perfprobe.status / perfprobe.top / perfprobe.spikes / perfprobe.timeline.");
+
+            // 0.5.4: the ~100 patches are applied as startup steps, at most 8 ms of them per frame (all at once froze the
+            // server ~4 s on a 138k-entity map). Each part starts timing as soon as it is patched; perfprobe.status shows progress.
+            var steps = new List<Action>();
+            if (_config.TimePluginTimers)
+                steps.Add(() => Puts(Probe.PatchTimers()));
+
+            int watched = 0;
+            var missing = new List<string>();
+            foreach (var spec in _config.WatchOnStartup)
+                steps.Add(() =>
+                {
+                    int count = Probe.WatchCount(spec, out string message);
+                    watched += count;
+                    if (count == 0) missing.Add(message);
+                });
+            steps.Add(() => Puts($"Watching {watched} method(s) from {_config.WatchOnStartup.Count} entries" +
+                                 (missing.Count > 0 ? $"; skipped: {string.Join("; ", missing)}" : string.Empty)));
+
+            if (_config.TimePluginHooks)
+            {
+                foreach (var plugin in plugins.GetAll())
+                    steps.Add(() => { if (Probe.Active) Probe.PatchPluginHooks(plugin); });
+                steps.Add(() => Puts($"Timing plugin hooks for {Probe.HookPatchedCount} plugin(s)" +
+                                     (Probe.HookPatchFailures > 0 ? $", {Probe.HookPatchFailures} could not be patched" : string.Empty)));
+            }
+
+            if (_config.TimeEntityCosts)
+                steps.Add(() => Puts(Probe.PatchEntityCosts()));
+
+            if (_config.WatchWorkQueues)
+            {
+                // Discovery runs as a step; the patches it finds are queued behind it as further steps
+                steps.Add(() => { Probe.Defer = Startup.Add; try { Puts(Probe.WatchJobRunners()); } finally { Probe.Defer = null; } });
+                steps.Add(() => { Probe.Defer = Startup.Add; try { Puts(Probe.WatchQueueFields()); } finally { Probe.Defer = null; } });
+            }
+
+            if (_config.TimeConsoleCommands)
+                steps.Add(() => Puts(Probe.PatchConsoleCommands()));
+
+            if (_config.TrackNetwork)
+                steps.Add(() => Puts(NetProbe.Patch(_harmony)));
+
+            if (_config.TimeRpcs)
+                steps.Add(() => Puts(Calls.PatchRpcs(_harmony)));
+
+            if (_config.ClientPerfReports)
+                steps.Add(() => Puts(Clients.Patch(this, _harmony, _config.PlayerSampleSeconds)));
+
+            Startup.Begin(this, watcher, steps, () =>
+                Puts($"Attached in {Startup.Seconds:0.0}s ({Startup.Total} patch steps{(Startup.Failed > 0 ? $", {Startup.Failed} failed, last: {Startup.LastError}" : string.Empty)}): " +
+                     $"watching {Probe.WatchedCount} method(s). Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline " +
+                     $"{(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}. Use perfprobe.status / perfprobe.top / perfprobe.spikes."));
+            Puts($"Attaching: {steps.Count} patch steps over the next few seconds (at most 8 ms per frame); perfprobe.status shows progress");
         }
 
         private void Unload()
@@ -308,7 +320,7 @@ namespace Oxide.Plugins
         {
             if (!Allowed(arg)) return;
             if (_detached) { arg.ReplyWith(Detacher.Running ? "PerfProbe is detaching (still removing patches)" : "PerfProbe detached, fast unload can now be performed"); return; }
-            arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
+            arg.ReplyWith(Startup.StatusLine() + Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
         [ConsoleCommand("perfprobe.spikes")]
@@ -748,6 +760,7 @@ namespace Oxide.Plugins
             public static float ThresholdMs = 50f;
             public static readonly double TickToMs = 1000.0 / Stopwatch.Frequency;
             public static int HookPatchedCount, HookPatchFailures;
+            public static int WatchedCount => Watched.Count;
 
             private const BindingFlags AllDeclared = BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
             private const int MaxDepth = 64;
@@ -833,6 +846,9 @@ namespace Oxide.Plugins
                 CommandKeys.Clear();
                 CalleeWatched.Clear();
                 InstanceNames.Clear();
+                Pending.Clear();
+                Defer = null;
+                _gameTypes = null;
                 Touched.Clear();
                 _timerMethod = null;
                 _consoleMethod = null;
@@ -1124,7 +1140,25 @@ namespace Oxide.Plugins
                 return patched;
             }
 
+            // 0.5.4: while attaching, watches queue up as startup steps instead of patching at once
+            public static Action<Action> Defer;
+            private static readonly HashSet<MethodBase> Pending = new HashSet<MethodBase>();
+
             private static bool WatchMethod(MethodBase target, string key, int category, out string error)
+            {
+                error = null;
+                if (Defer == null) return WatchMethodNow(target, key, category, out error);
+                if (Watched.Contains(target) || !Pending.Add(target)) return false;
+                Defer(() =>
+                {
+                    Pending.Remove(target);
+                    if (!Active || Watched.Contains(target)) return;
+                    if (!WatchMethodNow(target, key, category, out string e)) Startup.Fail(e);
+                });
+                return true;
+            }
+
+            private static bool WatchMethodNow(MethodBase target, string key, int category, out string error)
             {
                 error = null;
                 try
@@ -1146,7 +1180,7 @@ namespace Oxide.Plugins
 
             // Every ObjectWorkQueue<T> in the game runs its jobs through RunJob. Found by base type, so queues added by a
             // Rust update are picked up without a config change.
-            public static string WatchWorkQueues()
+            public static string WatchJobRunners()
             {
                 int failed = 0;
                 string lastError = null;
@@ -1170,6 +1204,13 @@ namespace Oxide.Plugins
                         else { failed++; lastError = error; }
                     }
                 }
+                return $"Timing {_workQueues} work queue job runner(s) (RunJob)" + (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
+            }
+
+            public static string WatchQueueFields()
+            {
+                int failed = 0;
+                string lastError = null;
                 // 0.5.2: the queues themselves. Every static ObjectWorkQueue / PersistentObjectWorkQueue field is named, and
                 // each runner (RunQueue, RunList) is patched once per generic definition; the per-instance finalizer splits it
                 // by queue. On a 138k-entity server the persistent queues were ~320 ms/s of ServerMgr.Update no watch named.
@@ -1203,7 +1244,7 @@ namespace Oxide.Plugins
                     }
                 }
 
-                return $"Timing {_workQueues} work queue job runner(s) (RunJob) and {named} named queue(s) through {runners} queue runner(s)" +
+                return $"Timing {named} named work queue(s) through {runners} queue runner(s)" +
                        (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
             }
 
@@ -1246,10 +1287,13 @@ namespace Oxide.Plugins
                 return AccessTools.TypeByName(name);
             }
 
+            private static Type[] _gameTypes;
+
             public static Type[] GameTypes()
             {
-                try { return typeof(BaseNetworkable).Assembly.GetTypes(); }
-                catch (ReflectionTypeLoadException e) { return e.Types.Where(t => t != null).ToArray(); }
+                if (_gameTypes != null) return _gameTypes;
+                try { return _gameTypes = typeof(BaseNetworkable).Assembly.GetTypes(); }
+                catch (ReflectionTypeLoadException e) { return _gameTypes = e.Types.Where(t => t != null).ToArray(); }
             }
 
             // 0.5.1: RunWithResult, the entry every command goes through, with a prefix that runs ahead of all others.
@@ -2435,6 +2479,79 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Startup
+
+        // 0.5.4. Patch steps run a few per frame from a coroutine on the frame watcher. Steps may add further steps
+        // (work-queue discovery queues the patches it finds), so the list is walked by index.
+        private static class Startup
+        {
+            public static bool Running;
+            public static int Done, Total, Failed;
+            public static string LastError;
+            private static List<Action> _steps = new List<Action>();
+            private static float _began, _ended;
+            private static bool _cancel;
+
+            public static float Seconds => (Running ? Time.realtimeSinceStartup : _ended) - _began;
+
+            public static void Add(Action step)
+            {
+                _steps.Add(step);
+                Total = _steps.Count;
+            }
+
+            public static void Fail(string error)
+            {
+                Failed++;
+                LastError = error;
+            }
+
+            public static void Begin(PerfProbe plugin, MonoBehaviour host, List<Action> steps, Action done)
+            {
+                _steps = steps;
+                Total = steps.Count;
+                Done = Failed = 0;
+                LastError = null;
+                _cancel = false;
+                Running = true;
+                _began = Time.realtimeSinceStartup;
+                host.StartCoroutine(Run(plugin, done));
+            }
+
+            public static void Cancel()
+            {
+                _cancel = true;
+                Running = false;
+            }
+
+            private static System.Collections.IEnumerator Run(PerfProbe plugin, Action done)
+            {
+                var sw = Stopwatch.StartNew();
+                for (int i = 0; i < _steps.Count && !_cancel; i++)
+                {
+                    if (sw.Elapsed.TotalMilliseconds >= 8)
+                    {
+                        yield return null;
+                        sw.Restart();
+                    }
+                    try { _steps[i](); }
+                    catch (Exception e) { Fail(e.Message); }
+                    Done = i + 1;
+                }
+                if (_cancel) yield break;
+                Running = false;
+                _ended = Time.realtimeSinceStartup;
+                try { done?.Invoke(); }
+                catch (Exception e) { plugin.PrintWarning("Attach summary failed: " + e.Message); }
+            }
+
+            public static string StatusLine() => Running
+                ? $"Attaching: {Done} of {Total} patch steps done ({Seconds:0.0}s); each part starts timing as soon as it is patched\n"
+                : string.Empty;
+        }
+
+        #endregion
+
         #region Detach
 
         // 0.5.3. Unload has to remove every patch at once (the plugin's code is about to go), ~4 s on a big server. Detach
@@ -2445,6 +2562,7 @@ namespace Oxide.Plugins
 
             public static string Start(PerfProbe plugin, Harmony harmony)
             {
+                Startup.Cancel();
                 Probe.Active = false;
                 Calls.StopForDetach();
                 Engine.StopForDetach();
