@@ -17,7 +17,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.5")]
+    [Info("PerfProbe", "LucienAI", "0.5.6")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
@@ -2310,7 +2310,7 @@ namespace Oxide.Plugins
                         try { _loopWriter?.Dispose(); } catch { }
                         string path = Path.Combine(dir, $"loop-{day}.csv");
                         bool exists = File.Exists(path);
-                        _loopWriter = new StreamWriter(path, true, new UTF8Encoding(false), 16 * 1024);
+                        _loopWriter = AppendWriter(path, 16 * 1024);
                         if (!exists) _loopWriter.WriteLine("time,seconds,system,ms_per_s,max_ms,over20ms");
                         _loopDay = day;
                     }
@@ -2520,6 +2520,11 @@ namespace Oxide.Plugins
         }
 
         #endregion
+
+        // CSV files are opened shareable: a writer left open by an older instance (plugin assemblies are never unloaded, and
+        // 0.5.1 and earlier did not close the loop CSV) otherwise blocks every later instance with a sharing violation
+        private static StreamWriter AppendWriter(string path, int buffer) =>
+            new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete), new UTF8Encoding(false), buffer);
 
         #region Startup
 
@@ -4000,7 +4005,7 @@ namespace Oxide.Plugins
                     }
                 }
 
-                var writer = new StreamWriter(path, true, new UTF8Encoding(false), 64 * 1024);
+                var writer = AppendWriter(path, 64 * 1024);
                 if (!exists) writer.WriteLine(header);
                 return writer;
             }
