@@ -18,9 +18,11 @@ Everything is read through console commands (server console, F1 console as admin
 ## Install
 
 1. Copy `PerfProbe.cs` into the server's `plugins` folder (`carbon/plugins` or `oxide/plugins`).
-2. It loads straight away and starts recording frames, then attaches its ~100 patches over the next few
-   seconds, at most 8 ms of patching per frame (`perfprobe.status` shows `Attaching: X of Y patch steps done`
-   until then, and `Attached in N s` prints at the end). The console shows what it is watching, for example
+2. It loads straight away and attaches: its ~100 patches go in over the next few seconds, at most 8 ms of
+   patching per frame. Until they are all in, `perfprobe.status` says `PerfProbe still patching: X of Y patch
+   steps done` and nothing is recorded; then `PerfProbe attached in N s ... recording started, a run can be
+   performed` prints and the stats start clean. (With `AttachOnLoad` off it loads with no patches and waits for
+   `perfprobe.attach`.) The console shows what it is watching, for example
    `Watching 32 method(s)...`, `Timing plugin hooks for 33 plugin(s)` and
    `Timing entity create/spawn/kill per prefab via 4 method(s)`, `Timing 6 work queue(s)`,
    `Timing console commands via ConsoleSystem.RunWithResult`,
@@ -60,7 +62,8 @@ All commands work from the server console and RCON. In the F1 console they need 
 | `perfprobe.timeline <from unix time> [rows]` | Per-second timeline as JSON, for graphing. `0` means from the start. |
 | `perfprobe.players <from unix time> [rows]` | Player position and activity samples as JSON, for graphing. |
 | `perfprobe.tp <player> <x> <y> <z>` | Teleport a player from the server console, e.g. to stand somewhere while you measure it. |
-| `perfprobe.detach` | Stops recording and removes every patch PerfProbe made, a few per frame (at most 8 ms per frame), then prints `PerfProbe detached, fast unload can now be performed`. Run it before unloading or reloading PerfProbe on a live server: unloading normally removes ~100 patches in one frame (~4 s freeze on a big server). While detached, commands that would patch again refuse; reload the plugin to attach again. |
+| `perfprobe.attach` | Applies every patch, a few per frame (at most 8 ms per frame), then starts recording with clean stats and prints `PerfProbe attached ... a run can be performed`. `perfprobe.status` says `still patching` until then, and commands that need the patches (`watch`, `invokes`, `behaviours`, `loop`, `callees`) wait for it. Runs automatically on load unless `AttachOnLoad` is off. |
+| `perfprobe.detach` | Stops recording and removes every patch PerfProbe made, a few per frame, then prints `PerfProbe detached, fast unload can now be performed`. Run it before unloading or reloading PerfProbe on a live server: unloading otherwise removes ~100 patches in one frame (~4 s freeze on a big server). `perfprobe.attach` attaches again without a reload. |
 | `perfprobe.reset` | Clear the spike, totals, churn, entity-cost and network stats. The timeline is kept. |
 
 ## Reading the numbers
@@ -232,6 +235,7 @@ Every spike is also written to the plugin's log file (`spikes`) in the server's 
 | `CsvRetentionDays` | 7 | How long CSV files are kept. |
 | `LoopSnapshotMinutes` | 5 | How often the player loop is timed for one second and the top systems kept (status, `perfprobe.loop`, loop CSV). 0 turns it off. |
 | `LoopSnapshotTop` | 8 | How many systems each snapshot keeps. |
+| `AttachOnLoad` | true | Attach (patch, then record) when the plugin loads. Off: load with no patches and wait for `perfprobe.attach`. |
 | `TrackNetwork` | true | Count packets and bytes sent per message type (`perfprobe.net`) and add network totals to the timeline. |
 | `WatchWorkQueues` | true | Time every work queue in the game (`queue:...`), found automatically: each `ObjectWorkQueue` job runner (`RunJob`), and every queue held in a static field (`ObjectWorkQueue` / `PersistentObjectWorkQueue`), named after that field, e.g. `queue:SomeType.someQueue.RunList`. On a 138k-entity server the persistent queues were a third of the main thread. |
 | `TimeConsoleCommands` | true | Time every console command (`cmd:...`), by the command name as typed, and RCON commands (`rcon:...`, which Carbon runs outside the console system). |
@@ -248,9 +252,9 @@ any entries you added.
   (well under 0.1% of one core).
 - All timing code is written never to throw inside game code: if a measurement fails, it is
   dropped and the game carries on.
-- Loading attaches the patches over several frames (0.5.4; before that, ~4 s in one frame on a 138k-entity
-  server). Unloading removes every patch it made, all in one frame (~4 s on the same server).
-  `perfprobe.detach` first removes them over several frames, so the unload is then instant.
+- Attaching applies the patches over several frames (before 0.5.4, ~4 s in one frame on a 138k-entity server).
+  Unloading removes every patch it made, all in one frame (~4 s on the same server); `perfprobe.detach` first
+  removes them over several frames, so the unload is then instant.
 - `perfprobe.entities` and `perfprobe.watch` on very busy methods are the only things that cost
   noticeably; both are opt-in. The loop snapshot adds ~170 stopwatch calls per frame for one second every
   `LoopSnapshotMinutes`. `perfprobe.behaviours` patches a few hundred methods for its window and unpatches

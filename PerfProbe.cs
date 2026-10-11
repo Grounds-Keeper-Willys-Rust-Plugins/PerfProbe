@@ -17,7 +17,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.4")]
+    [Info("PerfProbe", "LucienAI", "0.5.5")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
@@ -25,8 +25,11 @@ namespace Oxide.Plugins
 
         private static PerfProbe _instance;
 
-        // 0.5.3: set by perfprobe.detach; nothing re-patches until the plugin is reloaded
-        private static bool _detached;
+        // 0.5.5: perfprobe.attach / perfprobe.detach. Attaching applies the patches over several frames; recording
+        // starts, with clean stats, only once every patch is in. Detaching removes them over several frames.
+        private enum State { Detached, Attaching, Attached, Detaching }
+        private static State _state;
+        private FrameWatcher _watcher;
         private PluginConfig _config;
         private Harmony _harmony;
         private GameObject _host;
@@ -76,6 +79,10 @@ namespace Oxide.Plugins
 
             // 0.5.1: time every server RPC through BaseEntity.SV_RPCMessage (one patch; perfprobe.rpcs)
             public bool TimeRpcs = true;
+
+            // 0.5.5: attach (patch and start recording) when the plugin loads. Off: it loads with no patches and does
+            // nothing until perfprobe.attach.
+            public bool AttachOnLoad = true;
 
             // 0.5.0: ask each client for its fps and memory every PlayerSampleSeconds (perfprobe.clients, player samples).
             // Off by default: it sends every client an RPC and hooks BasePlayer.PerformanceReport by IL, which a Rust update can break.
@@ -179,17 +186,24 @@ namespace Oxide.Plugins
             _harmony = new Harmony(HarmonyId);
             Probe.Harmony = _harmony;
 
-            if (_config.TimelineEnabled)
-                Timeline.Init(_config);
-
             _host = new GameObject("PerfProbe");
-            var watcher = _host.AddComponent<FrameWatcher>();
-            Probe.Active = true;
-            Engine.Init(this, _config);
-            Calls.Init(this, watcher);
+            _watcher = _host.AddComponent<FrameWatcher>();
+            Calls.Init(this, _watcher);
 
-            // 0.5.4: the ~100 patches are applied as startup steps, at most 8 ms of them per frame (all at once froze the
-            // server ~4 s on a 138k-entity map). Each part starts timing as soon as it is patched; perfprobe.status shows progress.
+            _state = State.Detached;
+            Puts(_config.AttachOnLoad ? Attach() : "Loaded detached (AttachOnLoad is off): perfprobe.attach patches and starts recording");
+        }
+
+        // The ~100 patches are applied as steps, at most 8 ms of them per frame (all at once froze a 138k-entity server for
+        // ~4 s). Nothing is recorded until the last one is in; then the stats start clean, so a run covers a fully attached probe.
+        private string Attach()
+        {
+            _state = State.Attaching;
+            Probe.Active = false;
+            Probe.Shutdown();   // clears what a previous attach left (after a detach)
+            Probe.Harmony = _harmony;
+            Probe.Init(_config.SpikeThresholdMs, _config.PrintSpikesToConsole, _config.MaxStoredSpikes);
+
             var steps = new List<Action>();
             if (_config.TimePluginTimers)
                 steps.Add(() => Puts(Probe.PatchTimers()));
@@ -209,7 +223,7 @@ namespace Oxide.Plugins
             if (_config.TimePluginHooks)
             {
                 foreach (var plugin in plugins.GetAll())
-                    steps.Add(() => { if (Probe.Active) Probe.PatchPluginHooks(plugin); });
+                    steps.Add(() => { if (_state == State.Attaching) Probe.PatchPluginHooks(plugin); });
                 steps.Add(() => Puts($"Timing plugin hooks for {Probe.HookPatchedCount} plugin(s)" +
                                      (Probe.HookPatchFailures > 0 ? $", {Probe.HookPatchFailures} could not be patched" : string.Empty)));
             }
@@ -236,11 +250,23 @@ namespace Oxide.Plugins
             if (_config.ClientPerfReports)
                 steps.Add(() => Puts(Clients.Patch(this, _harmony, _config.PlayerSampleSeconds)));
 
-            Startup.Begin(this, watcher, steps, () =>
-                Puts($"Attached in {Startup.Seconds:0.0}s ({Startup.Total} patch steps{(Startup.Failed > 0 ? $", {Startup.Failed} failed, last: {Startup.LastError}" : string.Empty)}): " +
-                     $"watching {Probe.WatchedCount} method(s). Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline " +
-                     $"{(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}. Use perfprobe.status / perfprobe.top / perfprobe.spikes."));
-            Puts($"Attaching: {steps.Count} patch steps over the next few seconds (at most 8 ms per frame); perfprobe.status shows progress");
+            Startup.Begin(this, _watcher, steps, () =>
+            {
+                if (_state != State.Attaching) return;
+                Probe.Reset();
+                NetProbe.Reset();
+                Calls.ResetRpcs();
+                if (_config.TimelineEnabled)
+                    Timeline.Init(_config);
+                Engine.Init(this, _config);
+                Probe.Active = true;
+                _state = State.Attached;
+                Puts($"PerfProbe attached in {Startup.Seconds:0.0}s ({Startup.Total} patch steps{(Startup.Failed > 0 ? $", {Startup.Failed} failed, last: {Startup.LastError}" : string.Empty)}), " +
+                     $"watching {Probe.WatchedCount} method(s); recording started, a run can be performed. Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline " +
+                     $"{(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}.");
+            });
+            return $"Attaching: {steps.Count} patch steps over the next few seconds (at most 8 ms per frame); recording starts when they are all in " +
+                   "(perfprobe.status shows progress)";
         }
 
         private void Unload()
@@ -260,7 +286,7 @@ namespace Oxide.Plugins
         // Plugins loaded after us get their hook dispatcher timed too
         private void OnPluginLoaded(Plugin plugin)
         {
-            if (Probe.Active && _config.TimePluginHooks && plugin != null)
+            if ((_state == State.Attaching || _state == State.Attached) && _config.TimePluginHooks && plugin != null)
                 Probe.PatchPluginHooks(plugin);
         }
 
@@ -293,11 +319,31 @@ namespace Oxide.Plugins
 
         private bool Allowed(ConsoleSystem.Arg arg) => arg.Connection == null || arg.IsAdmin;
 
+        private static string StateText()
+        {
+            switch (_state)
+            {
+                case State.Attaching: return Startup.StatusLine();
+                case State.Detaching: return "PerfProbe detaching: still removing patches";
+                case State.Detached: return "PerfProbe detached: no patches, not recording; fast unload can be performed, perfprobe.attach starts it";
+                default: return "PerfProbe attached";
+            }
+        }
+
         private bool Attached(ConsoleSystem.Arg arg)
         {
-            if (!_detached) return true;
-            arg.ReplyWith("PerfProbe is detached; reload it to attach again");
+            if (_state == State.Attached) return true;
+            arg.ReplyWith(StateText());
             return false;
+        }
+
+        // perfprobe.attach: apply the patches over several frames, then start recording
+        [ConsoleCommand("perfprobe.attach")]
+        private void CmdAttach(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (_state != State.Detached) { arg.ReplyWith(_state == State.Attached ? "PerfProbe is already attached" : StateText()); return; }
+            arg.ReplyWith(Attach());
         }
 
         // perfprobe.detach: stop recording and remove every patch a few per frame, so the plugin can then be unloaded or
@@ -306,12 +352,8 @@ namespace Oxide.Plugins
         private void CmdDetach(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
-            if (_detached)
-            {
-                arg.ReplyWith(Detacher.Running ? "PerfProbe is detaching (still removing patches)" : "PerfProbe detached, fast unload can now be performed");
-                return;
-            }
-            _detached = true;
+            if (_state == State.Detached || _state == State.Detaching) { arg.ReplyWith(StateText()); return; }
+            _state = State.Detaching;
             arg.ReplyWith(Detacher.Start(this, _harmony));
         }
 
@@ -319,8 +361,8 @@ namespace Oxide.Plugins
         private void CmdStatus(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
-            if (_detached) { arg.ReplyWith(Detacher.Running ? "PerfProbe is detaching (still removing patches)" : "PerfProbe detached, fast unload can now be performed"); return; }
-            arg.ReplyWith(Startup.StatusLine() + Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
+            if (_state != State.Attached) { arg.ReplyWith(StateText()); return; }
+            arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
         [ConsoleCommand("perfprobe.spikes")]
@@ -1152,7 +1194,7 @@ namespace Oxide.Plugins
                 Defer(() =>
                 {
                     Pending.Remove(target);
-                    if (!Active || Watched.Contains(target)) return;
+                    if (Startup.Cancelled || Watched.Contains(target)) return;
                     if (!WatchMethodNow(target, key, category, out string e)) Startup.Fail(e);
                 });
                 return true;
@@ -2493,6 +2535,7 @@ namespace Oxide.Plugins
             private static bool _cancel;
 
             public static float Seconds => (Running ? Time.realtimeSinceStartup : _ended) - _began;
+            public static bool Cancelled => _cancel;
 
             public static void Add(Action step)
             {
@@ -2545,9 +2588,8 @@ namespace Oxide.Plugins
                 catch (Exception e) { plugin.PrintWarning("Attach summary failed: " + e.Message); }
             }
 
-            public static string StatusLine() => Running
-                ? $"Attaching: {Done} of {Total} patch steps done ({Seconds:0.0}s); each part starts timing as soon as it is patched\n"
-                : string.Empty;
+            public static string StatusLine() =>
+                $"PerfProbe still patching: {Done} of {Total} patch steps done ({Seconds:0.0}s); recording starts when they are all in";
         }
 
         #endregion
@@ -2581,15 +2623,22 @@ namespace Oxide.Plugins
 
                 var steps = work.Select(w => (Action)(() => harmony.Unpatch(w.Method, HarmonyPatchType.All, w.Id))).ToList();
                 Running = true;
-                bool started = Calls.Budgeted(steps, () =>
+                void Finish()
                 {
                     Running = false;
+                    Probe.Shutdown();
+                    Probe.Harmony = harmony;
+                    _state = State.Detached;
+                }
+                bool started = Calls.Budgeted(steps, () =>
+                {
+                    Finish();
                     plugin.Puts("PerfProbe detached, fast unload can now be performed");
                 });
                 if (!started)
                 {
                     foreach (var step in steps) { try { step(); } catch { } }
-                    Running = false;
+                    Finish();
                     return "PerfProbe detached, fast unload can now be performed";
                 }
                 return $"Detaching: recording stopped, removing {work.Count} patch(es) over the next few seconds (at most 8 ms per frame); " +
