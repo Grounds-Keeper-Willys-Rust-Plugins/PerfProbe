@@ -5,6 +5,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Text;
 using HarmonyLib;
 using Newtonsoft.Json;
@@ -16,8 +17,8 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.4.1")]
-    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab.")]
+    [Info("PerfProbe", "LucienAI", "0.5.0")]
+    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; windowed probes for every entity invoke and server RPC; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
         private const string HarmonyId = "com.lucienmp.perfprobe";
@@ -60,6 +61,19 @@ namespace Oxide.Plugins
             // (perfprobe.status, perfprobe.loop with no arguments, loop-YYYY-MM-DD.csv). 0 = off.
             public int LoopSnapshotMinutes = 5;
             public int LoopSnapshotTop = 8;
+
+            // 0.5.0: packets and bytes sent per network message type (perfprobe.net) and engine network totals in the timeline
+            public bool TrackNetwork = true;
+
+            // 0.5.0: time every ObjectWorkQueue<T>.RunJob in the game (queue:...) from startup
+            public bool WatchWorkQueues = true;
+
+            // 0.5.0: time every console command, including RCON and client-issued ones (cmd:...)
+            public bool TimeConsoleCommands = true;
+
+            // 0.5.0: ask each client for its fps and memory every PlayerSampleSeconds (perfprobe.clients, player samples).
+            // Off by default: it sends every client an RPC and hooks BasePlayer.PerformanceReport by IL, which a Rust update can break.
+            public bool ClientPerfReports = false;
         }
 
         private static List<string> DefaultWatchList() => new List<string>
@@ -70,19 +84,27 @@ namespace Oxide.Plugins
             "SpawnGroup.Spawn", "SpawnGroup.SpawnInitial", "SpawnGroup.Clear", "LootContainer.SpawnLoot",
             // Game loop
             "ServerMgr.Update", "ServerMgr.FixedUpdate", "ServerMgr.LateUpdate", "ServerMgr.DoTick",
-            "ServerBuildingManager.Cycle", "IOEntity.ProcessQueue", "TriggerParent.RunOnTick", "TreeManager.SendPendingTrees",
-            "Buoyancy.Cycle",
+            "ServerBuildingManager.Cycle", "ServerBuildingManager.Merge", "ServerBuildingManager.Split",
+            "IOEntity.ProcessQueue", "TriggerParent.RunOnTick", "TreeManager.SendPendingTrees",
+            "Buoyancy.Cycle", "BaseMountable.FixedUpdateCycle",
             // Players / network
             "ServerMgr.OnNetworkMessage", "ServerMgr.OnPlayerTick", "BasePlayer.ServerCycle", "BaseMountable.PlayerSyncCycle",
-            "EACServer.DoUpdate", "AntiHack.Cycle", "ConnectionQueue.Cycle",
+            "EACServer.DoUpdate", "AntiHack.Cycle", "ConnectionQueue.Cycle", "Facepunch.Network.Raknet.Server.Cycle",
             // NPC AI and navigation
-            "AIThinkManager.ProcessQueue",
+            "AIThinkManager.ProcessQueue", "BasePet.ProcessMovementQueue",
             "Rust.Ai.Gen2.Nav.RustNavigation.Tick", "Rust.Ai.Gen2.RustNavMeshAgent.TickEnabledComponents"
+        };
+
+        // Added to the defaults in config version 3; appended to existing lists so custom entries are kept
+        private static readonly string[] WatchAddedInV3 =
+        {
+            "ServerBuildingManager.Merge", "ServerBuildingManager.Split", "BaseMountable.FixedUpdateCycle",
+            "Facepunch.Network.Raknet.Server.Cycle", "BasePet.ProcessMovementQueue"
         };
 
         protected override void LoadDefaultConfig()
         {
-            _config = new PluginConfig { ConfigVersion = 2 };
+            _config = new PluginConfig { ConfigVersion = 3 };
             SaveConfig();
         }
 
@@ -107,6 +129,14 @@ namespace Oxide.Plugins
             {
                 _config.WatchOnStartup = DefaultWatchList();
                 _config.ConfigVersion = 2;
+            }
+
+            if (_config.ConfigVersion < 3)
+            {
+                foreach (var spec in WatchAddedInV3)
+                    if (!_config.WatchOnStartup.Contains(spec))
+                        _config.WatchOnStartup.Add(spec);
+                _config.ConfigVersion = 3;
             }
 
             _config.TimelineRetentionMinutes = Mathf.Clamp(_config.TimelineRetentionMinutes, 5, 24 * 60);
@@ -159,19 +189,34 @@ namespace Oxide.Plugins
             if (_config.TimeEntityCosts)
                 Puts(Probe.PatchEntityCosts());
 
+            if (_config.WatchWorkQueues)
+                Puts(Probe.WatchWorkQueues());
+
+            if (_config.TimeConsoleCommands)
+                Puts(Probe.PatchConsoleCommands());
+
+            if (_config.TrackNetwork)
+                Puts(NetProbe.Patch(_harmony));
+
+            if (_config.ClientPerfReports)
+                Puts(Clients.Patch(this, _harmony, _config.PlayerSampleSeconds));
+
             if (_config.TimelineEnabled)
                 Timeline.Init(_config);
 
             _host = new GameObject("PerfProbe");
-            _host.AddComponent<FrameWatcher>();
+            var watcher = _host.AddComponent<FrameWatcher>();
             Probe.Active = true;
             Engine.Init(this, _config);
+            Calls.Init(this, watcher);
             Puts($"Spikes >= {Probe.ThresholdMs:0}ms are recorded; timeline {(_config.TimelineEnabled ? $"keeps {_config.TimelineRetentionMinutes} min" : "off")}. " +
                  "Use perfprobe.status / perfprobe.top / perfprobe.spikes / perfprobe.timeline.");
         }
 
         private void Unload()
         {
+            Calls.Shutdown();
+            Clients.Shutdown();
             Engine.Shutdown();
             Probe.Active = false;
             if (_host != null)
@@ -222,7 +267,7 @@ namespace Oxide.Plugins
         private void CmdStatus(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
-            arg.ReplyWith(Probe.Status() + "\n" + Timeline.Status() + Engine.StatusSuffix());
+            arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
         [ConsoleCommand("perfprobe.spikes")]
@@ -307,7 +352,7 @@ namespace Oxide.Plugins
         {
             if (!Allowed(arg)) return;
             string spec = arg.GetString(0, string.Empty);
-            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.unwatch Type.Method | Type.* | all" : Probe.Unwatch(spec));
+            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.unwatch Type.Method | Type.* | prefix* (e.g. queue:*) | all" : Probe.Unwatch(spec));
         }
 
         [ConsoleCommand("perfprobe.find")]
@@ -397,12 +442,57 @@ namespace Oxide.Plugins
             arg.ReplyWith(Engine.Components(names));
         }
 
+        // perfprobe.invokes [seconds] [top] [filter]: time every Invoke/InvokeRepeating callback for a while, by method and the
+        // prefab it runs on. No arguments: the last result.
+        [ConsoleCommand("perfprobe.invokes")]
+        private void CmdInvokes(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (!arg.HasArgs(1)) { arg.ReplyWith(Calls.LastReport(true)); return; }
+            arg.ReplyWith(Calls.InvokesStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
+        }
+
+        // perfprobe.rpcs [seconds] [top] [filter]: time every [RPC_Server] method for a while (the filter limits which are patched).
+        // No arguments: the last result.
+        [ConsoleCommand("perfprobe.rpcs")]
+        private void CmdRpcs(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (!arg.HasArgs(1)) { arg.ReplyWith(Calls.LastReport(false)); return; }
+            arg.ReplyWith(Calls.RpcsStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
+        }
+
+        // perfprobe.net [count]: packets and bytes sent per network message type, plus the engine's own totals
+        [ConsoleCommand("perfprobe.net")]
+        private void CmdNet(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            arg.ReplyWith(NetProbe.Report(arg.GetInt(0, 20)));
+        }
+
+        // perfprobe.clients [count] [ping|loss|fps]: connection quality per player, and client fps/memory if ClientPerfReports is on
+        [ConsoleCommand("perfprobe.clients")]
+        private void CmdClients(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            int count = 30;
+            string sort = "ping";
+            for (int i = 0; arg.HasArgs(i + 1); i++)
+            {
+                string value = arg.GetString(i, string.Empty);
+                if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n)) count = n;
+                else sort = value.ToLowerInvariant();
+            }
+            arg.ReplyWith(Clients.Report(count, sort));
+        }
+
         [ConsoleCommand("perfprobe.reset")]
         private void CmdReset(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
             Probe.Reset();
-            arg.ReplyWith("PerfProbe spike stats reset (the timeline is kept)");
+            NetProbe.Reset();
+            arg.ReplyWith("PerfProbe spike, entity and network stats reset (the timeline is kept)");
         }
 
         #endregion
@@ -548,29 +638,37 @@ namespace Oxide.Plugins
         // watched calls nested inside it, so categories add up without double counting.
         private static class Cat
         {
+            // 0.5.0 appended invokes, rpcs, work_queues and console_commands (a CSV opened with the old header is set aside)
             public const int Spawning = 0, Ai = 1, Navigation = 2, Players = 3, GameLoop = 4,
-                             FixedScripts = 5, Timers = 6, Hooks = 7, OtherWatched = 8, Count = 9;
+                             FixedScripts = 5, Timers = 6, Hooks = 7, OtherWatched = 8,
+                             Invokes = 9, Rpcs = 10, WorkQueues = 11, Console = 12, Count = 13;
 
             public static readonly string[] Names =
             {
-                "spawning", "ai", "navigation", "players", "game_loop", "fixed_scripts", "plugin_timers", "plugin_hooks", "other_watched"
+                "spawning", "ai", "navigation", "players", "game_loop", "fixed_scripts", "plugin_timers", "plugin_hooks", "other_watched",
+                "invokes", "rpcs", "work_queues", "console_commands"
             };
 
             public static int For(string key)
             {
                 if (key.StartsWith("hook:", StringComparison.Ordinal)) return Hooks;
                 if (key.StartsWith("timer:", StringComparison.Ordinal)) return Timers;
+                if (key.StartsWith("invoke:", StringComparison.Ordinal)) return Invokes;
+                if (key.StartsWith("rpc:", StringComparison.Ordinal)) return Rpcs;
+                if (key.StartsWith("queue:", StringComparison.Ordinal)) return WorkQueues;
+                if (key.StartsWith("cmd:", StringComparison.Ordinal)) return Console;
                 if (key.StartsWith("SpawnHandler.", StringComparison.Ordinal) || key.StartsWith("SpawnGroup.", StringComparison.Ordinal) ||
                     key.StartsWith("SpawnPopulationBase.", StringComparison.Ordinal) || key.StartsWith("LootContainer.", StringComparison.Ordinal))
                     return Spawning;
-                if (key.StartsWith("AIThinkManager.", StringComparison.Ordinal)) return Ai;
+                if (key.StartsWith("AIThinkManager.", StringComparison.Ordinal) || key.StartsWith("BasePet.", StringComparison.Ordinal)) return Ai;
                 if (key.StartsWith("RustNavigation.", StringComparison.Ordinal) || key.StartsWith("RustNavMeshAgent.", StringComparison.Ordinal))
                     return Navigation;
                 if (key == "BasePlayer.ServerCycle" || key == "ServerMgr.OnPlayerTick" || key == "ServerMgr.OnNetworkMessage" ||
                     key.StartsWith("ConnectionQueue.", StringComparison.Ordinal) || key.StartsWith("EACServer.", StringComparison.Ordinal) ||
-                    key.StartsWith("AntiHack.", StringComparison.Ordinal) || key == "BaseMountable.PlayerSyncCycle")
+                    key.StartsWith("AntiHack.", StringComparison.Ordinal) || key == "BaseMountable.PlayerSyncCycle" || key == "Server.Cycle")
                     return Players;
-                if (key == "ServerMgr.FixedUpdate" || key.StartsWith("Buoyancy.", StringComparison.Ordinal)) return FixedScripts;
+                if (key == "ServerMgr.FixedUpdate" || key.StartsWith("Buoyancy.", StringComparison.Ordinal) ||
+                    key == "BaseMountable.FixedUpdateCycle") return FixedScripts;
                 if (key.StartsWith("ServerMgr.", StringComparison.Ordinal) || key.StartsWith("ServerBuildingManager.", StringComparison.Ordinal) ||
                     key.StartsWith("IOEntity.", StringComparison.Ordinal) || key.StartsWith("TriggerParent.", StringComparison.Ordinal) ||
                     key.StartsWith("TreeManager.", StringComparison.Ordinal))
@@ -599,7 +697,7 @@ namespace Oxide.Plugins
             private static int _mainThreadId;
             private static bool _faulted;
 
-            private class Stat { public long Ticks; public long SelfTicks; public int Calls; }
+            private class Stat { public string Key; public long Ticks; public long SelfTicks; public int Calls; }
             private class Agg { public double TotalMs; public long Calls; public double SpikeMs; public int SpikeHits; public double WorstMs; }
 
             // What each patched method is recorded as
@@ -607,6 +705,9 @@ namespace Oxide.Plugins
 
             // Per-frame buckets (reset every frame) and long-running aggregates (reset by perfprobe.reset)
             private static readonly Dictionary<string, Stat> FrameStats = new Dictionary<string, Stat>();
+            // The stats recorded this frame: end-of-frame work walks these, not every key ever seen (the invoke and RPC
+            // windows add thousands of keys)
+            private static readonly List<Stat> Touched = new List<Stat>();
             private static readonly Dictionary<string, int> FrameSpawns = new Dictionary<string, int>();
             private static readonly Dictionary<string, int> FrameKills = new Dictionary<string, int>();
             private static int _frameSpawnTotal, _frameKillTotal;
@@ -621,6 +722,11 @@ namespace Oxide.Plugins
             private static readonly HashSet<MethodBase> Watched = new HashSet<MethodBase>();
             private static readonly HashSet<Type> HookPatchedTypes = new HashSet<Type>();
             private static MethodBase _timerMethod;
+
+            // ConsoleSystem.Internal, timed per command
+            private static MethodBase _consoleMethod;
+            private static readonly Dictionary<object, string> CommandKeys = new Dictionary<object, string>();
+            private static int _workQueues;
 
             // Self-time stack: child time accumulated per nesting level
             private static readonly long[] ChildTicks = new long[MaxDepth];
@@ -660,7 +766,11 @@ namespace Oxide.Plugins
                 Targets.Clear();
                 HookPatchedTypes.Clear();
                 TimerKeys.Clear();
+                CommandKeys.Clear();
+                Touched.Clear();
                 _timerMethod = null;
+                _consoleMethod = null;
+                _workQueues = 0;
                 Harmony = null;
                 HookPatchedCount = HookPatchFailures = 0;
                 _entityPatched = _entityDepth = 0;
@@ -746,7 +856,7 @@ namespace Oxide.Plugins
             // Restores the caller's nesting level from the call's own state instead of decrementing a
             // shared counter, so a reset or a missed finalizer (e.g. a plugin reload issued from inside a
             // timed ServerMgr.DoTick) can never leave the stack unbalanced
-            private static long Pop(CallState state, out long self)
+            public static long Pop(CallState state, out long self)
             {
                 long elapsed = Stopwatch.GetTimestamp() - state.Start;
                 _depth = state.Depth;
@@ -755,11 +865,14 @@ namespace Oxide.Plugins
                 return elapsed;
             }
 
-            private static void Record(string key, int category, long ticks, long selfTicks)
+            public static void ResetDepth() => _depth = 0;
+
+            public static void Record(string key, int category, long ticks, long selfTicks)
             {
                 _instrumentedCalls++;
                 if (!FrameStats.TryGetValue(key, out var stat))
-                    FrameStats[key] = stat = new Stat();
+                    FrameStats[key] = stat = new Stat { Key = key };
+                if (stat.Calls == 0) Touched.Add(stat);
                 stat.Ticks += ticks;
                 stat.SelfTicks += selfTicks;
                 stat.Calls++;
@@ -888,30 +1001,117 @@ namespace Oxide.Plugins
                 foreach (var target in targets)
                 {
                     if (Watched.Contains(target)) continue;
-                    try
-                    {
-                        string key = Describe(target);
-                        Targets[target] = new Target { Key = key, Category = Cat.For(key) };
-                        Harmony.Patch(target, prefix: Prefix(), finalizer: new HarmonyMethod(typeof(Probe), nameof(TimingFinalizer)));
-                        Watched.Add(target);
-                        patched++;
-                    }
-                    catch (Exception e)
-                    {
-                        Targets.Remove(target);
-                        failed++;
-                        lastError = $"{Describe(target)}: {e.Message}";
-                    }
+                    string key = Describe(target);
+                    if (WatchMethod(target, key, Cat.For(key), out string error)) patched++;
+                    else { failed++; lastError = error; }
                 }
 
                 message = $"{spec}: watching {patched} method(s)" + (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
                 return patched;
             }
 
+            private static bool WatchMethod(MethodBase target, string key, int category, out string error)
+            {
+                error = null;
+                try
+                {
+                    Targets[target] = new Target { Key = key, Category = category };
+                    Harmony.Patch(target, prefix: Prefix(), finalizer: new HarmonyMethod(typeof(Probe), nameof(TimingFinalizer)));
+                    Watched.Add(target);
+                    return true;
+                }
+                catch (Exception e)
+                {
+                    Targets.Remove(target);
+                    error = $"{key}: {e.Message}";
+                    return false;
+                }
+            }
+
+            // Every ObjectWorkQueue<T> in the game runs its jobs through RunJob. Found by base type, so queues added by a
+            // Rust update are picked up without a config change.
+            public static string WatchWorkQueues()
+            {
+                int failed = 0;
+                string lastError = null;
+                foreach (var type in GameTypes())
+                {
+                    bool isQueue = false;
+                    try
+                    {
+                        if (type.ContainsGenericParameters) continue;
+                        for (var b = type.BaseType; b != null && !isQueue; b = b.BaseType)
+                            isQueue = b.IsGenericType && b.Name.StartsWith("ObjectWorkQueue", StringComparison.Ordinal);
+                    }
+                    catch { continue; }
+                    if (!isQueue) continue;
+
+                    foreach (var run in type.GetMethods(AllDeclared).Where(m => m.Name == "RunJob" && IsPatchable(m)))
+                    {
+                        if (Watched.Contains(run)) continue;
+                        string name = type.IsNested && type.DeclaringType != null ? type.DeclaringType.Name + "." + type.Name : type.Name;
+                        if (WatchMethod(run, "queue:" + name, Cat.WorkQueues, out string error)) _workQueues++;
+                        else { failed++; lastError = error; }
+                    }
+                }
+                return $"Timing {_workQueues} work queue(s) (ObjectWorkQueue RunJob)" + (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
+            }
+
+            public static Type[] GameTypes()
+            {
+                try { return typeof(BaseNetworkable).Assembly.GetTypes(); }
+                catch (ReflectionTypeLoadException e) { return e.Types.Where(t => t != null).ToArray(); }
+            }
+
+            public static string PatchConsoleCommands()
+            {
+                var method = typeof(ConsoleSystem).GetMethods(AllDeclared).FirstOrDefault(m =>
+                    m.Name == "Internal" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(ConsoleSystem.Arg));
+                if (method == null)
+                    return "Console command timing unavailable: ConsoleSystem.Internal(Arg) not found";
+                try
+                {
+                    Harmony.Patch(method, prefix: Prefix(), finalizer: new HarmonyMethod(typeof(Probe), nameof(ConsoleFinalizer)));
+                    _consoleMethod = method;
+                    return "Timing console commands via ConsoleSystem.Internal";
+                }
+                catch (Exception e)
+                {
+                    return "Console command timing failed: " + e.Message;
+                }
+            }
+
+            public static void ConsoleFinalizer(ConsoleSystem.Arg __0, CallState __state)
+            {
+                if (__state.Start == 0) return;
+                try
+                {
+                    long elapsed = Pop(__state, out long self);
+                    if (!Active) return;
+                    Record(CommandKey(__0), Cat.Console, elapsed, self);
+                }
+                catch
+                {
+                    _depth = 0;
+                }
+            }
+
+            private static string CommandKey(ConsoleSystem.Arg arg)
+            {
+                var cmd = arg?.cmd;
+                if (cmd == null) return "cmd:unknown";
+                if (CommandKeys.TryGetValue(cmd, out var key)) return key;
+                if (CommandKeys.Count > 5000) CommandKeys.Clear();
+                key = "cmd:" + (cmd.FullName ?? "unknown");
+                CommandKeys[cmd] = key;
+                return key;
+            }
+
             public static string Unwatch(string spec)
             {
                 bool all = spec == "all";
-                bool wildcard = spec.EndsWith(".*");
+                // Type.* or any key prefix ending in * (queue:*, cmd:...)
+                bool wildcard = spec.EndsWith("*");
                 string prefix = wildcard ? spec.Substring(0, spec.Length - 1) : null;
 
                 var targets = Watched.Where(m =>
@@ -931,7 +1131,7 @@ namespace Oxide.Plugins
                 return $"Unwatched {targets.Count} method(s)";
             }
 
-            private static bool IsPatchable(MethodInfo method)
+            public static bool IsPatchable(MethodInfo method)
             {
                 if (method.IsAbstract || method.IsGenericMethodDefinition || method.ContainsGenericParameters) return false;
                 if (method.DeclaringType == null || method.DeclaringType.ContainsGenericParameters) return false;
@@ -1263,6 +1463,7 @@ namespace Oxide.Plugins
                     _curSecond = second;
                     _secFrames = 0;
                     _secWorst = 0;
+                    NetProbe.RollSecond();
                 }
                 _secFrames++;
                 if (frameMs > _secWorst) _secWorst = frameMs;
@@ -1273,12 +1474,10 @@ namespace Oxide.Plugins
                 _g0 = g0;
 
                 bool spike = frameMs >= ThresholdMs;
-                foreach (var kv in FrameStats)
+                foreach (var stat in Touched)
                 {
-                    var stat = kv.Value;
-                    if (stat.Calls == 0) continue;
-                    if (!Aggregates.TryGetValue(kv.Key, out var agg))
-                        Aggregates[kv.Key] = agg = new Agg();
+                    if (!Aggregates.TryGetValue(stat.Key, out var agg))
+                        Aggregates[stat.Key] = agg = new Agg();
                     double ms = stat.Ticks * TickToMs;
                     agg.TotalMs += ms;
                     agg.Calls += stat.Calls;
@@ -1293,12 +1492,13 @@ namespace Oxide.Plugins
                 if (spike)
                     RecordSpike(frameMs, gc);
 
-                foreach (var stat in FrameStats.Values)
+                foreach (var stat in Touched)
                 {
                     stat.Ticks = 0;
                     stat.SelfTicks = 0;
                     stat.Calls = 0;
                 }
+                Touched.Clear();
                 if (_frameSpawnTotal > 0) FrameSpawns.Clear();
                 if (_frameKillTotal > 0) FrameKills.Clear();
                 if (FrameEntityMs.Count > 0) FrameEntityMs.Clear();
@@ -1318,10 +1518,10 @@ namespace Oxide.Plugins
                     sb.Append(" | GC g0+1 g1+1 g2+1");
                 sb.Append($" | heap {GC.GetTotalMemory(false) / 1048576}MB");
 
-                var top = FrameStats.Where(kv => kv.Value.Calls > 0)
-                    .OrderByDescending(kv => kv.Value.Ticks)
+                var top = Touched
+                    .OrderByDescending(stat => stat.Ticks)
                     .Take(8)
-                    .Select(kv => $"{kv.Key} {kv.Value.Ticks * TickToMs:0.0}ms/{kv.Value.Calls}")
+                    .Select(stat => $"{stat.Key} {stat.Ticks * TickToMs:0.0}ms/{stat.Calls}")
                     .ToList();
                 sb.Append(" | time: ").Append(top.Count == 0 ? "(nothing attributed)" : string.Join(", ", top));
 
@@ -1381,9 +1581,13 @@ namespace Oxide.Plugins
                 sb.AppendLine($"PerfProbe {(Active ? "active" : "inactive")}{(_faulted ? " (FAULTED - see console)" : string.Empty)}, threshold {ThresholdMs:0}ms");
                 sb.AppendLine($"Since reset ({minutes:0.0} min): {_frames:n0} frames, {_spikeCount} spikes ({_spikeCount / minutes:0.0}/min), worst frame {_worstFrameMs:0}ms");
                 sb.AppendLine($"Last {seconds}s: avg {(seconds > 0 ? frames / (double)seconds : 0):0} fps, worst frame {worst:0}ms, {spikeSeconds} second(s) contained a spike");
-                sb.AppendLine($"Watching {Watched.Count} method(s), plugin timers {(_timerMethod != null ? "timed" : "NOT timed")}, hooks timed for {HookPatchedCount} plugin(s), " +
-                              $"entity costs {(_entityPatched > 0 ? "timed" : "NOT timed")}");
-                sb.AppendLine($"Own overhead: {_instrumentedCalls / Math.Max(1.0, minutes * 60.0):0} timed calls/s (~{_instrumentedCalls / Math.Max(1.0, minutes * 60.0) * 0.3 / 1000.0:0.00}ms/s at ~0.3us each)");
+                sb.AppendLine($"Watching {Watched.Count} method(s) ({_workQueues} work queues), plugin timers {(_timerMethod != null ? "timed" : "NOT timed")}, hooks timed for {HookPatchedCount} plugin(s), " +
+                              $"entity costs {(_entityPatched > 0 ? "timed" : "NOT timed")}, console commands {(_consoleMethod != null ? "timed" : "NOT timed")}, " +
+                              $"network {(NetProbe.Patched ? "counted" : "NOT counted")}, client reports {(Clients.Active ? "on" : "off")}");
+                double callsPerSecond = _instrumentedCalls / Math.Max(1.0, minutes * 60.0);
+                double netPerSecond = NetProbe.CallsPerSecond();
+                sb.AppendLine($"Own overhead: {callsPerSecond:0} timed calls/s (~{callsPerSecond * 0.3 / 1000.0:0.00}ms/s at ~0.3us each)" +
+                              (NetProbe.Patched ? $", {netPerSecond:0} packet sends/s counted (~{netPerSecond * 0.15 / 1000.0:0.00}ms/s at ~0.15us each)" : string.Empty));
                 sb.Append($"GC collections: {GC.CollectionCount(0)}; heap {GC.GetTotalMemory(false) / 1048576}MB");
                 return sb.ToString();
             }
@@ -1843,6 +2047,980 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Call windows
+
+        // 0.5.0. Two kinds of game code are too frequent to time permanently and too many to name in a watch list: entity
+        // invokes (every Invoke/InvokeRepeating callback, run by the invoke scheduler) and server RPCs (every [RPC_Server]
+        // method, ~1-2 thousand of them). Like perfprobe.behaviours they are patched for a window and unpatched after. While
+        // a window records, its calls also feed spikes, top and the timeline through the same self-time stack as everything
+        // else. RPCs are found and patched over several frames (at most PatchBudgetMs per frame) so the probe never makes a
+        // spike of its own.
+        private static class Calls
+        {
+            private const double PatchBudgetMs = 8;
+            private const int MaxPrefabsPerStat = 200;
+            private const BindingFlags AllDeclared = BindingFlags.DeclaredOnly | BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+            private static readonly long Over20Ticks = Stopwatch.Frequency / 50;
+
+            private static PerfProbe _plugin;
+            private static MonoBehaviour _host;
+            private static int _invReplaced;
+
+            private class PrefabStat { public long Ticks; public int Calls; }
+
+            private class CallStat
+            {
+                public string Key;
+                public bool Match = true;
+                public long Ticks, SelfTicks, MaxTicks;
+                public int Calls, Over20;
+                public Dictionary<string, PrefabStat> Prefabs;
+            }
+
+            private class Window
+            {
+                public string Kind, Id;
+                public int Category;
+                public string State = "idle"; // idle, finding, patching, recording, unpatching
+                public bool Recording;
+                public Harmony Harmony;
+                public Timer Timer;
+                public Coroutine Job;
+                public string Filter = string.Empty;
+                public int Seconds, Top;
+                public float Start;
+                public readonly List<MethodBase> Found = new List<MethodBase>();
+                public readonly List<MethodBase> Patched = new List<MethodBase>();
+                public readonly Dictionary<MethodBase, CallStat> Stats = new Dictionary<MethodBase, CallStat>();
+                public int Failed;
+                public string LastError, LastReport;
+            }
+
+            private static readonly Window Inv = new Window { Kind = "invokes", Id = HarmonyId + ".invokes", Category = Cat.Invokes };
+            private static readonly Window Rpc = new Window { Kind = "rpcs", Id = HarmonyId + ".rpcs", Category = Cat.Rpcs };
+
+            public static void Init(PerfProbe plugin, MonoBehaviour host)
+            {
+                _plugin = plugin;
+                _host = host;
+            }
+
+            public static void Shutdown()
+            {
+                foreach (var w in new[] { Inv, Rpc })
+                {
+                    w.Recording = false;
+                    w.Timer?.Destroy();
+                    w.Timer = null;
+                    try { if (w.Job != null && _host != null) _host.StopCoroutine(w.Job); } catch { }
+                    w.Job = null;
+                    try { w.Harmony?.UnpatchAll(w.Id); }
+                    catch (Exception e) { _plugin?.PrintError($"{w.Kind} probe unpatch failed: {e.Message}"); }
+                    w.Harmony = null;
+                    w.Patched.Clear();
+                    w.Found.Clear();
+                    w.State = "idle";
+                }
+                _plugin = null;
+                _host = null;
+            }
+
+            public static string InvokesStart(int seconds, int top, string filter)
+            {
+                string busy = Busy(Inv);
+                if (busy != null) return busy;
+                Inv.Found.Clear();
+                string error = FindInvokeTicks(Inv.Found);
+                if (Inv.Found.Count == 0) return "Invoke probe unavailable: " + error;
+                _invReplaced = 0;
+                Begin(Inv, seconds, top, filter, null);
+                return $"Invoke probe: timing every Invoke/InvokeRepeating callback{FilterText(filter)} for {seconds}s " +
+                       $"(the invoke scheduler is patched for the window); the result prints to the console";
+            }
+
+            public static string RpcsStart(int seconds, int top, string filter)
+            {
+                string busy = Busy(Rpc);
+                if (busy != null) return busy;
+                var attr = typeof(BaseEntity).GetNestedType("RPC_Server", BindingFlags.Public | BindingFlags.NonPublic);
+                if (attr == null) return "RPC probe unavailable: BaseEntity.RPC_Server not found";
+                Rpc.Found.Clear();
+                Begin(Rpc, seconds, top, filter, FindRpcs(attr, filter ?? string.Empty));
+                return $"RPC probe: finding and patching every [RPC_Server] method{FilterText(filter)} over the next few seconds " +
+                       $"(at most {PatchBudgetMs:0}ms per frame), then timing for {seconds}s; progress and the result print to the console";
+            }
+
+            public static string LastReport(bool invokes)
+            {
+                var w = invokes ? Inv : Rpc;
+                string usage = invokes ? "perfprobe.invokes <seconds> [top] [filter]" : "perfprobe.rpcs <seconds> [top] [filter]";
+                string state = w.State == "idle" ? string.Empty : Busy(w) + "\n";
+                return state + (w.LastReport ?? $"No {w.Kind} result yet. {usage} runs one");
+            }
+
+            public static string StatusLine()
+            {
+                string Line(Window w) => w.State == "recording"
+                    ? $"recording, {Math.Max(0, w.Seconds - (Time.realtimeSinceStartup - w.Start)):0}s left"
+                    : w.State;
+                return $"\nCall windows: invokes {Line(Inv)}, rpcs {Line(Rpc)} (perfprobe.invokes / perfprobe.rpcs)";
+            }
+
+            private static string Busy(Window w)
+            {
+                if (_plugin == null || _host == null) return "PerfProbe not initialised";
+                if (w.State == "idle") return null;
+                if (w.State == "recording")
+                    return $"{w.Kind} probe already running, {Math.Max(0, w.Seconds - (Time.realtimeSinceStartup - w.Start)):0}s left";
+                return $"{w.Kind} probe busy ({w.State})";
+            }
+
+            private static string FilterText(string filter) => string.IsNullOrEmpty(filter) ? string.Empty : $" matching '{filter}'";
+
+            private static void Begin(Window w, int seconds, int top, string filter, System.Collections.IEnumerator find)
+            {
+                w.Seconds = seconds;
+                w.Top = Mathf.Clamp(top, 5, 100);
+                w.Filter = filter ?? string.Empty;
+                w.Stats.Clear();
+                w.Patched.Clear();
+                w.Failed = 0;
+                w.LastError = null;
+                w.Harmony = new Harmony(w.Id);
+                w.State = "finding";
+                w.Job = _host.StartCoroutine(Run(w, find));
+            }
+
+            private static System.Collections.IEnumerator Run(Window w, System.Collections.IEnumerator find)
+            {
+                string failure = null;
+                if (find != null)
+                {
+                    while (true)
+                    {
+                        bool more;
+                        try { more = find.MoveNext(); }
+                        catch (Exception e) { failure = "search failed: " + e.Message; break; }
+                        if (!more) break;
+                        yield return null;
+                    }
+                }
+                if (failure == null && w.Found.Count == 0)
+                    failure = "nothing to patch" + FilterText(w.Filter);
+
+                if (failure == null)
+                {
+                    w.State = "patching";
+                    bool isInvoke = w == Inv;
+                    var prefix = isInvoke ? null : new HarmonyMethod(typeof(Calls), nameof(RpcPrefix)) { priority = Priority.First };
+                    var finalizer = isInvoke ? null : new HarmonyMethod(typeof(Calls), nameof(RpcFinalizer));
+                    var transpiler = isInvoke ? new HarmonyMethod(typeof(Calls), nameof(InvokeTranspiler)) : null;
+                    var sw = Stopwatch.StartNew();
+                    foreach (var method in w.Found)
+                    {
+                        if (sw.Elapsed.TotalMilliseconds >= PatchBudgetMs)
+                        {
+                            yield return null;
+                            sw.Restart();
+                        }
+                        try
+                        {
+                            w.Harmony.Patch(method, prefix, null, transpiler, finalizer);
+                            w.Patched.Add(method);
+                        }
+                        catch (Exception e)
+                        {
+                            w.Failed++;
+                            w.LastError = $"{method.DeclaringType?.Name}.{method.Name}: {e.Message.Split('\n')[0]}";
+                        }
+                    }
+                    if (w.Patched.Count == 0) failure = "patching failed: " + w.LastError;
+                    else if (isInvoke && _invReplaced == 0) failure = "no Action.Invoke call found in the invoke scheduler (a Rust update changed it)";
+                }
+
+                if (_plugin == null) yield break;
+                if (failure != null)
+                {
+                    try { w.Harmony.UnpatchAll(w.Id); } catch { }
+                    w.Harmony = null;
+                    w.Patched.Clear();
+                    w.Job = null;
+                    w.State = "idle";
+                    w.LastReport = $"[PerfProbe] {w.Kind} probe: {failure}";
+                    _plugin.Puts(w.LastReport);
+                    yield break;
+                }
+
+                w.Start = Time.realtimeSinceStartup;
+                w.Recording = true;
+                w.State = "recording";
+                w.Job = null;
+                w.Timer = _plugin.timer.Once(w.Seconds, () => Stop(w));
+                _plugin.Puts($"[PerfProbe] {w.Kind} probe: {w.Patched.Count} method(s) patched" +
+                             (w.Failed > 0 ? $", {w.Failed} failed (last: {w.LastError})" : string.Empty) + $"; timing for {w.Seconds}s");
+            }
+
+            private static void Stop(Window w)
+            {
+                if (w.State != "recording") return;
+                w.Recording = false;
+                w.Timer = null;
+                float secs = Math.Max(0.001f, Time.realtimeSinceStartup - w.Start);
+                w.LastReport = BuildReport(w, secs);
+                _plugin?.Puts(w.LastReport);
+                w.State = "unpatching";
+                if (_host != null) w.Job = _host.StartCoroutine(Unpatch(w));
+            }
+
+            private static System.Collections.IEnumerator Unpatch(Window w)
+            {
+                var sw = Stopwatch.StartNew();
+                foreach (var method in w.Patched)
+                {
+                    if (sw.Elapsed.TotalMilliseconds >= PatchBudgetMs)
+                    {
+                        yield return null;
+                        sw.Restart();
+                    }
+                    try { w.Harmony.Unpatch(method, HarmonyPatchType.All, w.Id); }
+                    catch (Exception e) { _plugin?.PrintWarning($"{w.Kind} probe: unpatching {method.Name} failed: {e.Message}"); }
+                }
+                w.Patched.Clear();
+                w.Harmony = null;
+                w.Job = null;
+                w.State = "idle";
+            }
+
+            #region Invokes
+
+            // The scheduler is InvokeHandlerBase<T>.DoTick; every closed base in its assembly is patched
+            private static string FindInvokeTicks(List<MethodBase> into)
+            {
+                var handler = AccessTools.TypeByName("InvokeHandler");
+                if (handler == null) return "InvokeHandler not found";
+                Type generic = null;
+                for (var b = handler.BaseType; b != null && generic == null; b = b.BaseType)
+                    if (b.IsGenericType && b.Name.StartsWith("InvokeHandlerBase", StringComparison.Ordinal))
+                        generic = b.GetGenericTypeDefinition();
+                if (generic == null) return "InvokeHandlerBase<T> not found";
+
+                Type[] types;
+                try { types = handler.Assembly.GetTypes(); }
+                catch (ReflectionTypeLoadException e) { types = e.Types.Where(t => t != null).ToArray(); }
+                foreach (var t in types)
+                {
+                    var b = t?.BaseType;
+                    if (b == null || !b.IsGenericType || b.ContainsGenericParameters || b.GetGenericTypeDefinition() != generic) continue;
+                    foreach (var tick in b.GetMethods(AllDeclared).Where(m => m.Name == "DoTick" && !m.IsAbstract))
+                        if (!into.Contains(tick)) into.Add(tick);
+                }
+                return into.Count == 0 ? "InvokeHandlerBase<T>.DoTick not found" : null;
+            }
+
+            // Replaces the callback's Action.Invoke() inside DoTick with InvokeWrapper(action): same stack shape, no
+            // dependency on the InvokeAction type (the approach Rust.ServerMetrics uses, applied for a window only)
+            public static IEnumerable<CodeInstruction> InvokeTranspiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var invoke = AccessTools.Method(typeof(Action), nameof(Action.Invoke));
+                var wrapper = AccessTools.Method(typeof(Calls), nameof(InvokeWrapper));
+                foreach (var ci in instructions)
+                {
+                    if ((ci.opcode == OpCodes.Callvirt || ci.opcode == OpCodes.Call) && ci.operand is MethodInfo m && m == invoke)
+                    {
+                        ci.opcode = OpCodes.Call;
+                        ci.operand = wrapper;
+                        _invReplaced++;
+                    }
+                    yield return ci;
+                }
+            }
+
+            public static void InvokeWrapper(Action action)
+            {
+                if (!Inv.Recording)
+                {
+                    action();
+                    return;
+                }
+                Probe.TimingPrefix(out var state);
+                try
+                {
+                    action();
+                }
+                finally
+                {
+                    InvokeDone(action, state);
+                }
+            }
+
+            // Never throws (same rules as Probe.TimingPrefix): on any error the measurement is dropped
+            private static void InvokeDone(Action action, Probe.CallState state)
+            {
+                if (state.Start == 0) return;
+                try
+                {
+                    long elapsed = Probe.Pop(state, out long self);
+                    if (!Inv.Recording || !Probe.Active) return;
+                    var method = action.Method;
+                    if (!Inv.Stats.TryGetValue(method, out var stat))
+                    {
+                        string key = InvokeKey(method);
+                        Inv.Stats[method] = stat = new CallStat
+                        {
+                            Key = key,
+                            Match = Inv.Filter.Length == 0 || key.IndexOf(Inv.Filter, StringComparison.OrdinalIgnoreCase) >= 0
+                        };
+                    }
+                    if (!stat.Match) return;
+                    Add(stat, elapsed, self, action.Target);
+                    Probe.Record(stat.Key, Cat.Invokes, elapsed, self);
+                }
+                catch
+                {
+                    Probe.ResetDepth();
+                }
+            }
+
+            // Lambdas live in compiler-generated closure classes: name them after the class that declared the lambda
+            private static string InvokeKey(MethodInfo method)
+            {
+                var type = method.DeclaringType;
+                if (type == null) return "invoke:" + method.Name;
+                if (type.Name.StartsWith("<", StringComparison.Ordinal) && type.DeclaringType != null)
+                    return $"invoke:{type.DeclaringType.Name}.{method.Name}";
+                return $"invoke:{type.Name}.{method.Name}";
+            }
+
+            #endregion
+
+            #region RPCs
+
+            private static System.Collections.IEnumerator FindRpcs(Type attr, string filter)
+            {
+                var sw = Stopwatch.StartNew();
+                foreach (var type in Probe.GameTypes())
+                {
+                    if (sw.Elapsed.TotalMilliseconds >= PatchBudgetMs)
+                    {
+                        yield return null;
+                        sw.Restart();
+                    }
+                    MethodInfo[] methods;
+                    try
+                    {
+                        if (type.ContainsGenericParameters) continue;
+                        methods = type.GetMethods(AllDeclared);
+                    }
+                    catch { continue; }
+                    foreach (var m in methods)
+                    {
+                        bool rpc;
+                        try { rpc = m.IsDefined(attr, false) && Probe.IsPatchable(m); }
+                        catch { continue; }
+                        if (!rpc) continue;
+                        string key = $"rpc:{type.Name}.{m.Name}";
+                        if (filter.Length > 0 && key.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        Rpc.Found.Add(m);
+                        Rpc.Stats[m] = new CallStat { Key = key };
+                    }
+                }
+            }
+
+            public static void RpcPrefix(out Probe.CallState __state)
+            {
+                if (Rpc.Recording) Probe.TimingPrefix(out __state);
+                else __state = default;
+            }
+
+            public static void RpcFinalizer(MethodBase __originalMethod, object __instance, Probe.CallState __state)
+            {
+                if (__state.Start == 0) return;
+                try
+                {
+                    long elapsed = Probe.Pop(__state, out long self);
+                    if (!Rpc.Recording || !Probe.Active || !Rpc.Stats.TryGetValue(__originalMethod, out var stat)) return;
+                    Add(stat, elapsed, self, __instance);
+                    Probe.Record(stat.Key, Cat.Rpcs, elapsed, self);
+                }
+                catch
+                {
+                    Probe.ResetDepth();
+                }
+            }
+
+            #endregion
+
+            private static void Add(CallStat stat, long elapsed, long self, object target)
+            {
+                stat.Ticks += elapsed;
+                stat.SelfTicks += self;
+                stat.Calls++;
+                if (elapsed > stat.MaxTicks) stat.MaxTicks = elapsed;
+                if (elapsed > Over20Ticks) stat.Over20++;
+
+                var entity = target as BaseNetworkable;
+                if ((object)entity == null) return;
+                string prefab = entity.ShortPrefabName ?? "unknown";
+                if (stat.Prefabs == null) stat.Prefabs = new Dictionary<string, PrefabStat>();
+                if (!stat.Prefabs.TryGetValue(prefab, out var p))
+                {
+                    if (stat.Prefabs.Count >= MaxPrefabsPerStat) return;
+                    stat.Prefabs[prefab] = p = new PrefabStat();
+                }
+                p.Ticks += elapsed;
+                p.Calls++;
+            }
+
+            private static string BuildReport(Window w, float secs)
+            {
+                double ms = Probe.TickToMs;
+                var stats = w.Stats.Values.Where(s => s.Calls > 0).ToList();
+                double totalMs = stats.Sum(s => (double)s.Ticks) * ms, selfMs = stats.Sum(s => (double)s.SelfTicks) * ms;
+                double calls = stats.Sum(s => (double)s.Calls);
+                string what = w == Inv ? "Invoke/InvokeRepeating callbacks" : $"server RPCs ({w.Patched.Count} [RPC_Server] methods patched)";
+
+                var sb = new StringBuilder();
+                sb.Append($"[PerfProbe] {what} over {secs:0}s{FilterText(w.Filter)}: {stats.Count} distinct, {calls / secs:n0} calls/s, " +
+                          $"{totalMs / secs:F1} ms/s ({selfMs / secs:F1} ms/s self, without timed calls nested inside); " +
+                          $"probe cost ~{calls / secs * 0.3 / 1000.0:F1} ms/s\n");
+                if (stats.Count == 0) return sb.Append("  nothing was called").ToString();
+
+                foreach (var s in stats.OrderByDescending(x => x.Ticks).Take(w.Top))
+                {
+                    sb.Append($"  {s.Ticks * ms / secs,8:F2} ms/s {s.Calls / secs,8:F0}/s  avg {s.Ticks * ms / s.Calls,6:F3} ms  max {s.MaxTicks * ms,6:F1} ms  >20ms {s.Over20,3}  {s.Key}");
+                    if (s.SelfTicks < s.Ticks * 0.9) sb.Append($"  (self {s.SelfTicks * ms / secs:F2} ms/s)");
+                    sb.Append('\n');
+                    if (s.Prefabs != null && s.Prefabs.Count > 0)
+                        sb.Append("           on: " + string.Join(", ", s.Prefabs.OrderByDescending(kv => kv.Value.Ticks).Take(4)
+                                      .Select(kv => $"{kv.Key} {kv.Value.Ticks * ms / secs:F2}ms/s {kv.Value.Calls / secs:F0}/s")) +
+                                  (s.Prefabs.Count > 4 ? $" (+{s.Prefabs.Count - 4} more prefabs)" : string.Empty) + "\n");
+                }
+
+                sb.Append("  -- most called:\n");
+                foreach (var s in stats.OrderByDescending(x => x.Calls).Take(Math.Min(w.Top, 12)))
+                    sb.Append($"  {s.Calls / secs,8:F0}/s  {s.Ticks * ms / secs,8:F2} ms/s  {s.Key}\n");
+
+                var worst = stats.Where(x => x.MaxTicks * ms >= 5).OrderByDescending(x => x.MaxTicks).Take(10).ToList();
+                if (worst.Count > 0)
+                {
+                    sb.Append("  -- by worst single call:\n");
+                    foreach (var s in worst)
+                        sb.Append($"  max {s.MaxTicks * ms,6:F1} ms  >20ms {s.Over20,3}  {s.Key}\n");
+                }
+                sb.Append($"  (during the window these also fed perfprobe.spikes, perfprobe.top and the timeline's {Cat.Names[w.Category]}_ms column)");
+                return sb.ToString();
+            }
+        }
+
+        #endregion
+
+        #region Network
+
+        // 0.5.0. Packets and bytes sent per message type, counted once per recipient (NetWrite.PacketID remembers the
+        // type, NetWrite.Send counts it), plus the engine's own totals. Net.sv's stat and ping methods are looked up by
+        // reflection so a renamed member costs the column, not the plugin.
+        private static class NetProbe
+        {
+            public static bool Patched;
+            private static int _lastType;
+            private static Func<object, long> _length;
+            private static readonly string[] Names = new string[256];
+            private static readonly long[] Packets = new long[256], Bytes = new long[256];             // since reset
+            private static readonly long[] SecPackets = new long[256], SecBytes = new long[256];       // second in progress
+            private static readonly long[] LastPackets = new long[256], LastBytes = new long[256];     // last full second
+            private static long _calls, _secCalls;
+            private static float _since;
+
+            private static bool _lookedUp;
+            private static MethodInfo _getStat, _getPing;
+            private static Type _statEnum;
+            private static readonly Dictionary<string, object> StatIds = new Dictionary<string, object>();
+
+            public static string Patch(Harmony harmony)
+            {
+                Patched = false;
+                var writeType = AccessTools.TypeByName("Network.NetWrite");
+                if (writeType == null) return "Network counters unavailable: Network.NetWrite not found";
+                const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                var packetId = writeType.GetMethods(flags).FirstOrDefault(m => m.Name == "PacketID" && m.GetParameters().Length == 1 &&
+                                                                              m.GetParameters()[0].ParameterType == typeof(global::Network.Message.Type));
+                var send = writeType.GetMethods(flags).FirstOrDefault(m => m.Name == "Send" && m.GetParameters().Length == 1 &&
+                                                                          m.GetParameters()[0].ParameterType == typeof(global::Network.SendInfo));
+                if (packetId == null || send == null)
+                    return $"Network counters unavailable: NetWrite.{(packetId == null ? "PacketID(Message.Type)" : "Send(SendInfo)")} not found";
+
+                _length = LengthReader(writeType);
+                var typeEnum = typeof(global::Network.Message.Type);
+                for (int i = 0; i < 256; i++)
+                {
+                    string name = null;
+                    try { name = Enum.GetName(typeEnum, Enum.ToObject(typeEnum, i)); } catch { }
+                    Names[i] = name ?? "type" + i;
+                }
+
+                try
+                {
+                    harmony.Patch(packetId, postfix: new HarmonyMethod(typeof(NetProbe), nameof(PacketIdPostfix)));
+                    harmony.Patch(send, prefix: new HarmonyMethod(typeof(NetProbe), nameof(SendPrefix)));
+                }
+                catch (Exception e)
+                {
+                    try { harmony.Unpatch(packetId, HarmonyPatchType.All, HarmonyId); } catch { }
+                    return "Network counters failed: " + e.Message;
+                }
+                Patched = true;
+                Reset();
+                return "Counting packets sent per message type via NetWrite.PacketID/Send" + (_length == null ? " (packet sizes unavailable)" : string.Empty);
+            }
+
+            private static Func<object, long> LengthReader(Type type)
+            {
+                try
+                {
+                    if (typeof(Stream).IsAssignableFrom(type)) return o => ((Stream)o).Length;
+                    var param = System.Linq.Expressions.Expression.Parameter(typeof(object), "o");
+                    var cast = System.Linq.Expressions.Expression.Convert(param, type);
+                    System.Linq.Expressions.Expression member = null;
+                    var prop = AccessTools.Property(type, "Length");
+                    if (prop != null && prop.GetIndexParameters().Length == 0 && prop.GetGetMethod(true) != null)
+                        member = System.Linq.Expressions.Expression.Property(cast, prop);
+                    else
+                    {
+                        var field = AccessTools.Field(type, "Length") ?? AccessTools.Field(type, "length") ?? AccessTools.Field(type, "_length");
+                        if (field != null) member = System.Linq.Expressions.Expression.Field(cast, field);
+                    }
+                    if (member == null) return null;
+                    return System.Linq.Expressions.Expression.Lambda<Func<object, long>>(
+                        System.Linq.Expressions.Expression.Convert(member, typeof(long)), param).Compile();
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            public static void PacketIdPostfix(global::Network.Message.Type __0) => _lastType = (int)__0 & 255;
+
+            public static void SendPrefix(object __instance, global::Network.SendInfo __0)
+            {
+                try
+                {
+                    _secCalls++;
+                    int recipients = __0.connection != null ? 1 : __0.connections != null ? __0.connections.Count : 0;
+                    if (recipients == 0) return;
+                    int type = _lastType;
+                    SecPackets[type] += recipients;
+                    if (_length != null) SecBytes[type] += _length(__instance) * recipients;
+                }
+                catch
+                {
+                    // counting only; never disturb a send
+                }
+            }
+
+            // Called once per second by the frame accounting
+            public static void RollSecond()
+            {
+                if (!Patched) return;
+                for (int i = 0; i < 256; i++)
+                {
+                    LastPackets[i] = SecPackets[i];
+                    LastBytes[i] = SecBytes[i];
+                    Packets[i] += SecPackets[i];
+                    Bytes[i] += SecBytes[i];
+                    SecPackets[i] = 0;
+                    SecBytes[i] = 0;
+                }
+                _calls += _secCalls;
+                _secCalls = 0;
+            }
+
+            public static void Reset()
+            {
+                Array.Clear(Packets, 0, Packets.Length);
+                Array.Clear(Bytes, 0, Bytes.Length);
+                _calls = 0;
+                _since = Time.realtimeSinceStartup;
+            }
+
+            public static long LastSecondPackets() => Patched ? LastPackets.Sum() : 0;
+
+            public static double CallsPerSecond() => _calls / Math.Max(1.0, Time.realtimeSinceStartup - _since);
+
+            // Engine stat by its BaseNetwork.StatTypeLong name; connection null = server-wide. -1 when unavailable.
+            public static long Stat(object connection, string name)
+            {
+                try
+                {
+                    object sv = global::Network.Net.sv;
+                    if (sv == null) return -1;
+                    LookUp(sv);
+                    if (_getStat == null) return -1;
+                    if (!StatIds.TryGetValue(name, out var id))
+                    {
+                        try { id = Enum.Parse(_statEnum, name); } catch { id = null; }
+                        StatIds[name] = id;
+                    }
+                    if (id == null) return -1;
+                    return Convert.ToInt64(_getStat.Invoke(sv, new[] { connection, id }), CultureInfo.InvariantCulture);
+                }
+                catch
+                {
+                    return -1;
+                }
+            }
+
+            public static double Ping(object connection)
+            {
+                if (connection == null) return -1;
+                try
+                {
+                    object sv = global::Network.Net.sv;
+                    if (sv == null) return -1;
+                    LookUp(sv);
+                    if (_getPing == null) return -1;
+                    return Convert.ToDouble(_getPing.Invoke(sv, new[] { connection }), CultureInfo.InvariantCulture);
+                }
+                catch
+                {
+                    return -1;
+                }
+            }
+
+            private static void LookUp(object sv)
+            {
+                if (_lookedUp) return;
+                _lookedUp = true;
+                var methods = sv.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                _getStat = methods.FirstOrDefault(m =>
+                {
+                    var ps = m.GetParameters();
+                    return m.Name == "GetStat" && ps.Length == 2 && ps[1].ParameterType.IsEnum && ps[1].ParameterType.Name == "StatTypeLong";
+                });
+                _statEnum = _getStat?.GetParameters()[1].ParameterType;
+                _getPing = methods.FirstOrDefault(m => m.Name == "GetAveragePing" && m.GetParameters().Length == 1);
+            }
+
+            public static string StatusLine()
+            {
+                long inBytes = Stat(null, "BytesReceived_LastSecond"), outBytes = Stat(null, "BytesSent_LastSecond");
+                string engine = inBytes < 0 && outBytes < 0
+                    ? "engine totals unavailable"
+                    : $"in {inBytes / 1024.0:0} KB/s, out {outBytes / 1024.0:0} KB/s, packet loss {Stat(null, "PacketLossLastSecond")}";
+                return $"Network (last second): {engine}" +
+                       (Patched ? $"; {LastSecondPackets():n0} packets sent to players (perfprobe.net)" : string.Empty);
+            }
+
+            public static string Report(int count)
+            {
+                if (!Patched) return "Network counters are off (TrackNetwork in the config) or could not be patched";
+                count = Mathf.Clamp(count, 1, 60);
+                float secs = Math.Max(1f, Time.realtimeSinceStartup - _since);
+                long packets = Packets.Sum(), bytes = Bytes.Sum();
+                bool sizes = _length != null;
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Network sent over {secs / 60f:0.0} min, counted once per recipient: {packets / secs:n0} packets/s" +
+                              (sizes ? $", {bytes / secs / 1024:0.0} KB/s of payload" : " (packet sizes unavailable)"));
+                sb.AppendLine(StatusLine());
+                sb.AppendLine(sizes ? "By message type: packets/s, KB/s, average size | last second" : "By message type: packets/s | last second");
+                foreach (int i in Enumerable.Range(0, 256).Where(i => Packets[i] > 0 || LastPackets[i] > 0)
+                             .OrderByDescending(i => sizes ? Bytes[i] : Packets[i]).Take(count))
+                {
+                    sb.Append($"  {Names[i]}: {Packets[i] / secs:n0}/s");
+                    if (sizes) sb.Append($", {Bytes[i] / secs / 1024:0.0} KB/s, avg {(Packets[i] > 0 ? Bytes[i] / (double)Packets[i] : 0):0} B");
+                    sb.Append($" | {LastPackets[i]:n0}" + (sizes ? $" / {LastBytes[i] / 1024.0:0.0} KB" : string.Empty));
+                    sb.AppendLine();
+                }
+                return sb.ToString().TrimEnd();
+            }
+        }
+
+        #endregion
+
+        #region Clients
+
+        // 0.5.0, opt-in (ClientPerfReports). Every PlayerSampleSeconds each client is asked for a performance report, the
+        // way Rust.ServerMetrics does it: the "legacy" request, tagged with our own request id. The reply arrives in
+        // BasePlayer.PerformanceReport; a transpiler hands it to OnReport inside the "legacy" branch, and replies carrying our
+        // id skip the vanilla console print. Replies to an admin's own requests are left alone.
+        private static class Clients
+        {
+            private static readonly int RequestId = new System.Random().Next(1, int.MaxValue);
+
+            private class Sample { public double Fps, MemoryMB; public float At; }
+
+            private static readonly Dictionary<ulong, Sample> Latest = new Dictionary<ulong, Sample>();
+            private static MethodBase _method;
+            private static Timer _timer;
+            private static bool _transpiled;
+            private static float _every;
+
+            public static bool Active => _method != null;
+
+            public static string Patch(PerfProbe plugin, Harmony harmony, float everySeconds)
+            {
+                var method = typeof(BasePlayer).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly)
+                    .FirstOrDefault(m => m.Name == "PerformanceReport" && m.GetParameters().Length == 1);
+                if (method == null) return "Client reports unavailable: BasePlayer.PerformanceReport not found";
+
+                _transpiled = false;
+                try { harmony.Patch(method, transpiler: new HarmonyMethod(typeof(Clients), nameof(ReportTranspiler))); }
+                catch (Exception e) { return "Client reports failed: " + e.Message; }
+                if (!_transpiled)
+                {
+                    try { harmony.Unpatch(method, HarmonyPatchType.Transpiler, HarmonyId); } catch { }
+                    return "Client reports unavailable: BasePlayer.PerformanceReport has changed (no \"legacy\" branch with a report to hook)";
+                }
+
+                _method = method;
+                _every = Math.Max(5f, everySeconds);
+                _timer = plugin.timer.Every(_every, RequestAll);
+                return $"Asking clients for fps/memory every {_every:0}s via BasePlayer.PerformanceReport";
+            }
+
+            public static void Shutdown()
+            {
+                _timer?.Destroy();
+                _timer = null;
+                _method = null;
+                Latest.Clear();
+            }
+
+            private static void RequestAll()
+            {
+                foreach (var player in BasePlayer.activePlayerList)
+                {
+                    try
+                    {
+                        if (player == null || !player.IsConnected || player.IsReceivingSnapshot) continue;
+                        player.ClientRPC(RpcTarget.Player("GetPerformanceReport", player), "legacy", RequestId);
+                    }
+                    catch
+                    {
+                        // one client failing must not stop the others
+                    }
+                }
+                if (Latest.Count > BasePlayer.activePlayerList.Count * 2 + 50)
+                {
+                    var online = new HashSet<ulong>(BasePlayer.activePlayerList.Where(p => p != null).Select(p => (ulong)p.userID));
+                    foreach (var id in Latest.Keys.Where(id => !online.Contains(id)).ToList()) Latest.Remove(id);
+                }
+            }
+
+            // After `if (format == "legacy")` inserts: if (Clients.OnReport(this, report)) return;
+            public static IEnumerable<CodeInstruction> ReportTranspiler(IEnumerable<CodeInstruction> instructions, MethodBase original, ILGenerator generator)
+            {
+                var list = instructions.ToList();
+                try
+                {
+                    var body = original.GetMethodBody();
+                    if (body == null || body.ExceptionHandlingClauses.Count > 0) return list;
+                    var report = body.LocalVariables.FirstOrDefault(l => l.LocalType.Name.IndexOf("PerformanceReport", StringComparison.Ordinal) >= 0);
+                    if (report == null || report.LocalType.IsValueType) return list;
+                    foreach (var field in new[] { "request_id", "fps", "memory_system" })
+                        if (!Reflect.Has(report.LocalType, field)) return list;
+
+                    int idx = list.FindIndex(ci => ci.opcode == OpCodes.Ldstr && ci.operand as string == "legacy");
+                    if (idx < 0 || idx + 2 >= list.Count) return list;
+                    if (!(list[idx + 1].operand is MethodInfo eq && eq.Name == "op_Equality")) return list;
+                    var branch = list[idx + 2];
+                    if (branch.opcode != OpCodes.Brfalse && branch.opcode != OpCodes.Brfalse_S) return list;
+                    var load = list.FirstOrDefault(ci => LocalIndex(ci) == report.LocalIndex);
+                    var last = list[list.Count - 1];
+                    if (load == null || last.opcode != OpCodes.Ret) return list;
+
+                    var end = generator.DefineLabel();
+                    last.labels.Add(end);
+                    list.InsertRange(idx + 3, new[]
+                    {
+                        new CodeInstruction(OpCodes.Ldarg_0),
+                        new CodeInstruction(load.opcode, load.operand),
+                        new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(Clients), nameof(OnReport))),
+                        new CodeInstruction(OpCodes.Brtrue, end)
+                    });
+                    _transpiled = true;
+                    return list;
+                }
+                catch
+                {
+                    return list;
+                }
+            }
+
+            private static int LocalIndex(CodeInstruction ci)
+            {
+                if (ci.opcode == OpCodes.Ldloc_0) return 0;
+                if (ci.opcode == OpCodes.Ldloc_1) return 1;
+                if (ci.opcode == OpCodes.Ldloc_2) return 2;
+                if (ci.opcode == OpCodes.Ldloc_3) return 3;
+                if (ci.opcode != OpCodes.Ldloc && ci.opcode != OpCodes.Ldloc_S) return -1;
+                if (ci.operand is LocalBuilder builder) return builder.LocalIndex;
+                if (ci.operand is int i) return i;
+                if (ci.operand is byte b) return b;
+                if (ci.operand is short s) return s;
+                return -1;
+            }
+
+            public static bool OnReport(BasePlayer player, object report)
+            {
+                try
+                {
+                    if ((object)player == null || report == null || (int)Reflect.Num(report, "request_id", 0) != RequestId) return false;
+                    Latest[player.userID] = new Sample
+                    {
+                        Fps = Reflect.Num(report, "fps"),
+                        MemoryMB = Reflect.Num(report, "memory_system", 0),
+                        At = Time.realtimeSinceStartup
+                    };
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            public static bool TryGet(ulong id, float maxAge, out double fps, out double memoryMB)
+            {
+                fps = -1;
+                memoryMB = 0;
+                if (!Latest.TryGetValue(id, out var s) || Time.realtimeSinceStartup - s.At > maxAge) return false;
+                fps = s.Fps;
+                memoryMB = s.MemoryMB;
+                return true;
+            }
+
+            public static string Report(int count, string sort)
+            {
+                count = Mathf.Clamp(count, 1, 200);
+                float now = Time.realtimeSinceStartup;
+                var rows = new List<(string Name, double Ping, long Loss, double Fps, double Mem, float Age)>();
+                foreach (var p in BasePlayer.activePlayerList)
+                {
+                    if (p == null) continue;
+                    var connection = p.net?.connection;
+                    double fps = -1, mem = 0;
+                    float age = -1;
+                    if (Latest.TryGetValue(p.userID, out var s))
+                    {
+                        fps = s.Fps;
+                        mem = s.MemoryMB;
+                        age = now - s.At;
+                    }
+                    rows.Add((p.displayName ?? p.UserIDString, NetProbe.Ping(connection), NetProbe.Stat(connection, "PacketLossLastSecond"), fps, mem, age));
+                }
+                if (rows.Count == 0) return "No players online";
+
+                if (sort == "fps") rows = rows.OrderBy(r => r.Fps < 0 ? double.MaxValue : r.Fps).ToList();
+                else if (sort == "loss") rows = rows.OrderByDescending(r => r.Loss).ThenByDescending(r => r.Ping).ToList();
+                else rows = rows.OrderByDescending(r => r.Ping).ToList();
+
+                var withFps = rows.Where(r => r.Fps >= 0).Select(r => r.Fps).ToList();
+                var sb = new StringBuilder();
+                sb.Append($"{rows.Count} player(s) online, median ping {Median(rows.Where(r => r.Ping >= 0).Select(r => r.Ping).ToList()):0}ms, " +
+                          $"{rows.Count(r => r.Loss > 0)} with packet loss in the last second");
+                sb.AppendLine(Active
+                    ? $"; client reports every {_every:0}s: {withFps.Count} reporting, median {Median(withFps):0} fps, {withFps.Count(f => f < 30)} under 30 fps"
+                    : "; client fps/memory off (ClientPerfReports in the config)");
+                foreach (var r in rows.Take(count))
+                {
+                    string name = r.Name.Length > 20 ? r.Name.Substring(0, 20) : r.Name;
+                    sb.Append($"  {name,-20} ping {r.Ping,4:0}ms  loss {r.Loss,3}");
+                    if (r.Fps >= 0) sb.Append($"  client {r.Fps,3:0} fps {r.Mem,6:0}MB ({r.Age:0}s ago)");
+                    sb.AppendLine();
+                }
+                return sb.ToString().TrimEnd();
+            }
+
+            private static double Median(List<double> values)
+            {
+                if (values.Count == 0) return 0;
+                values.Sort();
+                return values[values.Count / 2];
+            }
+        }
+
+        #endregion
+
+        #region Live counters
+
+        // Scheduler and connection-queue counters read on demand. Members outside the usual plugin surface are read by
+        // reflection (cached), so a rename costs a number, not the plugin.
+        private static class Live
+        {
+            public static float EngineKB(string stat)
+            {
+                long bytes = NetProbe.Stat(null, stat);
+                return bytes < 0 ? 0 : bytes / 1024f;
+            }
+
+            private static object ConnectionQueue()
+            {
+                var mgr = ServerMgr.Instance;
+                return mgr == null ? null : Reflect.Get(mgr, "connectionQueue");
+            }
+
+            public static long Joining() => (long)Reflect.Num(ConnectionQueue(), "Joining");
+
+            public static long Queued() => (long)Reflect.Num(ConnectionQueue(), "Queued");
+
+            public static string Status()
+            {
+                var perf = Performance.current;
+                return $"Scheduler: {perf.invokeHandlerTasks} invoke tasks, {perf.loadBalancerTasks} load balancer tasks, " +
+                       $"workshop skin queue {Reflect.Num(perf, "workshopSkinsQueued", 0):0}; connection queue {Joining()} joining, {Queued()} queued\n" +
+                       NetProbe.StatusLine();
+            }
+        }
+
+        // Cached property/field readers by type and name, for the few members read by reflection
+        private static class Reflect
+        {
+            private static readonly Dictionary<Type, Dictionary<string, Func<object, object>>> Getters =
+                new Dictionary<Type, Dictionary<string, Func<object, object>>>();
+
+            public static object Get(object obj, string name)
+            {
+                if (obj == null) return null;
+                try
+                {
+                    var type = obj.GetType();
+                    if (!Getters.TryGetValue(type, out var byName))
+                        Getters[type] = byName = new Dictionary<string, Func<object, object>>();
+                    if (!byName.TryGetValue(name, out var get))
+                        byName[name] = get = Build(type, name);
+                    return get?.Invoke(obj);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            public static double Num(object obj, string name, double fallback = -1)
+            {
+                var value = Get(obj, name);
+                if (value == null) return fallback;
+                try { return Convert.ToDouble(value, CultureInfo.InvariantCulture); }
+                catch { return fallback; }
+            }
+
+            public static bool Has(Type type, string name) => Build(type, name) != null;
+
+            private static Func<object, object> Build(Type type, string name)
+            {
+                var prop = AccessTools.Property(type, name);
+                if (prop != null && prop.GetIndexParameters().Length == 0 && prop.GetGetMethod(true) != null)
+                    return o => prop.GetValue(o, null);
+                var field = AccessTools.Field(type, name);
+                if (field != null) return o => field.GetValue(o);
+                return null;
+            }
+        }
+
+        #endregion
+
         #region Timeline
 
         // One row per second (aligned to Rust's own Performance sampling) plus player samples every few
@@ -1860,6 +3038,9 @@ namespace Oxide.Plugins
                 public float Update, LateUpdate, PreLateUpdate, FixedUpdate, Physics, TotalCpu;
                 public float GcPauseMs;
                 public int HeapMB, Gc, Invokes, LoadBalancer, Entities, Players, Spikes, Spawned, Killed;
+                // 0.5.0: engine network totals for the last second, packets PerfProbe counted, connection and skin queues
+                public float NetInKB, NetOutKB;
+                public int PacketLoss, PacketsOut, Joining, Queued, SkinQueue;
             }
 
             private struct PlayerSample
@@ -1870,13 +3051,18 @@ namespace Oxide.Plugins
                 public ushort SpeedDm; // decimetres per second
                 public byte Flags;     // 1 sleeping, 2 mounted, 4 wounded, 8 dead
                 public ushort Build, Attack, Loot, Craft, Gather;
+                // 0.5.0: connection quality, and the client's own report (-1 / 0 when there is none)
+                public ushort PingMs, PacketLoss;
+                public short ClientFps;
+                public ushort ClientMemMB;
             }
 
             private static readonly string[] RowColumns =
             {
                 "time", "frames", "worst_frame_ms",
                 "update_ms", "late_update_ms", "pre_late_update_ms", "fixed_update_ms", "physics_ms", "total_cpu_ms",
-                "gc_pause_ms", "heap_mb", "gc", "invoke_tasks", "load_balancer_tasks", "entities", "players", "spikes", "spawned", "killed"
+                "gc_pause_ms", "heap_mb", "gc", "invoke_tasks", "load_balancer_tasks", "entities", "players", "spikes", "spawned", "killed",
+                "net_in_kb", "net_out_kb", "packet_loss", "packets_out", "joining", "queued", "workshop_skin_queue"
             };
 
             private static bool _enabled;
@@ -2063,7 +3249,14 @@ namespace Oxide.Plugins
                     Players = BasePlayer.activePlayerList.Count,
                     Spikes = _secSpikes,
                     Spawned = _secSpawned,
-                    Killed = _secKilled
+                    Killed = _secKilled,
+                    NetInKB = Live.EngineKB("BytesReceived_LastSecond"),
+                    NetOutKB = Live.EngineKB("BytesSent_LastSecond"),
+                    PacketLoss = (int)Math.Max(0, NetProbe.Stat(null, "PacketLossLastSecond")),
+                    PacketsOut = (int)Math.Min(int.MaxValue, NetProbe.LastSecondPackets()),
+                    Joining = (int)Math.Max(0, Live.Joining()),
+                    Queued = (int)Math.Max(0, Live.Queued()),
+                    SkinQueue = (int)Math.Max(0, Reflect.Num(perf, "workshopSkinsQueued"))
                 };
 
                 int slot = _rowHead;
@@ -2100,6 +3293,8 @@ namespace Oxide.Plugins
                     if (player.IsDead()) flags |= 8;
 
                     int a = index * ActCount;
+                    var connection = player.net?.connection;
+                    Clients.TryGet(player.userID, _config.PlayerSampleSeconds * 3f, out double clientFps, out double clientMem);
                     var sample = new PlayerSample
                     {
                         Time = time,
@@ -2112,7 +3307,11 @@ namespace Oxide.Plugins
                         Attack = _activity[a + ActAttack],
                         Loot = _activity[a + ActLoot],
                         Craft = _activity[a + ActCraft],
-                        Gather = _activity[a + ActGather]
+                        Gather = _activity[a + ActGather],
+                        PingMs = (ushort)Mathf.Clamp((float)NetProbe.Ping(connection), 0, ushort.MaxValue),
+                        PacketLoss = (ushort)Mathf.Clamp(NetProbe.Stat(connection, "PacketLossLastSecond"), 0, ushort.MaxValue),
+                        ClientFps = (short)Mathf.Clamp((float)clientFps, -1, short.MaxValue),
+                        ClientMemMB = (ushort)Mathf.Clamp((float)clientMem, 0, ushort.MaxValue)
                     };
                     Array.Clear(_activity, a, ActCount);
 
@@ -2138,7 +3337,7 @@ namespace Oxide.Plugins
                 _rowWriter = OpenCsv($"timeline-{day}.csv",
                     string.Join(",", RowColumns) + "," + string.Join(",", Cat.Names.Select(n => n + "_ms")));
                 _playerWriter = OpenCsv($"players-{day}.csv",
-                    "time,steamid,name,x,z,speed_mps,sleeping,mounted,wounded,dead,build,attack,loot,craft,gather");
+                    "time,steamid,name,x,z,speed_mps,sleeping,mounted,wounded,dead,build,attack,loot,craft,gather,ping_ms,packet_loss,client_fps,client_mem_mb");
                 if (newDay)
                     CompressOldFiles();
             }
@@ -2147,6 +3346,19 @@ namespace Oxide.Plugins
             {
                 string path = Path.Combine(_dir, name);
                 bool exists = File.Exists(path);
+
+                // A file started by an older version has other columns: set it aside rather than append misaligned rows
+                if (exists)
+                {
+                    string first = null;
+                    try { using (var reader = new StreamReader(path)) first = reader.ReadLine(); } catch { }
+                    if (first != null && first != header)
+                    {
+                        File.Move(path, Path.Combine(_dir, Path.GetFileNameWithoutExtension(name) + "-old-" + DateTime.UtcNow.ToString("HHmmss") + ".csv"));
+                        exists = false;
+                    }
+                }
+
                 var writer = new StreamWriter(path, true, new UTF8Encoding(false), 64 * 1024);
                 if (!exists) writer.WriteLine(header);
                 return writer;
@@ -2178,7 +3390,14 @@ namespace Oxide.Plugins
                     w.Write(r.Players.ToString(ci)); w.Write(',');
                     w.Write(r.Spikes.ToString(ci)); w.Write(',');
                     w.Write(r.Spawned.ToString(ci)); w.Write(',');
-                    w.Write(r.Killed.ToString(ci));
+                    w.Write(r.Killed.ToString(ci)); w.Write(',');
+                    w.Write(r.NetInKB.ToString("0.0", ci)); w.Write(',');
+                    w.Write(r.NetOutKB.ToString("0.0", ci)); w.Write(',');
+                    w.Write(r.PacketLoss.ToString(ci)); w.Write(',');
+                    w.Write(r.PacketsOut.ToString(ci)); w.Write(',');
+                    w.Write(r.Joining.ToString(ci)); w.Write(',');
+                    w.Write(r.Queued.ToString(ci)); w.Write(',');
+                    w.Write(r.SkinQueue.ToString(ci));
                     for (int c = 0; c < Cat.Count; c++)
                     {
                         w.Write(',');
@@ -2211,7 +3430,8 @@ namespace Oxide.Plugins
                         s.Time.ToString(ci), steamId.ToString(ci), CsvEscape(name), s.X.ToString(ci), s.Z.ToString(ci),
                         (s.SpeedDm / 10f).ToString("0.0", ci),
                         (s.Flags & 1) != 0 ? "1" : "0", (s.Flags & 2) != 0 ? "1" : "0", (s.Flags & 4) != 0 ? "1" : "0", (s.Flags & 8) != 0 ? "1" : "0",
-                        s.Build.ToString(ci), s.Attack.ToString(ci), s.Loot.ToString(ci), s.Craft.ToString(ci), s.Gather.ToString(ci)));
+                        s.Build.ToString(ci), s.Attack.ToString(ci), s.Loot.ToString(ci), s.Craft.ToString(ci), s.Gather.ToString(ci),
+                        s.PingMs.ToString(ci), s.PacketLoss.ToString(ci), s.ClientFps.ToString(ci), s.ClientMemMB.ToString(ci)));
                 }
                 catch (Exception e)
                 {
@@ -2295,7 +3515,10 @@ namespace Oxide.Plugins
                       .Append(r.HeapMB.ToString(ci)).Append(',').Append(r.Gc.ToString(ci)).Append(',')
                       .Append(r.Invokes.ToString(ci)).Append(',').Append(r.LoadBalancer.ToString(ci)).Append(',')
                       .Append(r.Entities.ToString(ci)).Append(',').Append(r.Players.ToString(ci)).Append(',')
-                      .Append(r.Spikes.ToString(ci)).Append(',').Append(r.Spawned.ToString(ci)).Append(',').Append(r.Killed.ToString(ci));
+                      .Append(r.Spikes.ToString(ci)).Append(',').Append(r.Spawned.ToString(ci)).Append(',').Append(r.Killed.ToString(ci)).Append(',')
+                      .Append(r.NetInKB.ToString("0.0", ci)).Append(',').Append(r.NetOutKB.ToString("0.0", ci)).Append(',')
+                      .Append(r.PacketLoss.ToString(ci)).Append(',').Append(r.PacketsOut.ToString(ci)).Append(',')
+                      .Append(r.Joining.ToString(ci)).Append(',').Append(r.Queued.ToString(ci)).Append(',').Append(r.SkinQueue.ToString(ci));
                     for (int c = 0; c < Cat.Count; c++)
                         sb.Append(',').Append(_cats[slot * Cat.Count + c].ToString("0.00", ci));
                     sb.Append(']');
@@ -2311,7 +3534,7 @@ namespace Oxide.Plugins
             {
                 var ci = CultureInfo.InvariantCulture;
                 var sb = new StringBuilder(64 * 1024);
-                sb.Append("{\"columns\":[\"time\",\"player\",\"x\",\"z\",\"speed_dm\",\"flags\",\"build\",\"attack\",\"loot\",\"craft\",\"gather\"]");
+                sb.Append("{\"columns\":[\"time\",\"player\",\"x\",\"z\",\"speed_dm\",\"flags\",\"build\",\"attack\",\"loot\",\"craft\",\"gather\",\"ping_ms\",\"packet_loss\",\"client_fps\",\"client_mem_mb\"]");
                 sb.Append(",\"flags\":\"1 sleeping, 2 mounted, 4 wounded, 8 dead\",\"rows\":[");
 
                 var used = new HashSet<int>();
@@ -2326,7 +3549,9 @@ namespace Oxide.Plugins
                     sb.Append('[').Append(s.Time.ToString(ci)).Append(',').Append(s.Player.ToString(ci)).Append(',')
                       .Append(s.X.ToString(ci)).Append(',').Append(s.Z.ToString(ci)).Append(',').Append(s.SpeedDm.ToString(ci)).Append(',')
                       .Append(s.Flags.ToString(ci)).Append(',').Append(s.Build.ToString(ci)).Append(',').Append(s.Attack.ToString(ci)).Append(',')
-                      .Append(s.Loot.ToString(ci)).Append(',').Append(s.Craft.ToString(ci)).Append(',').Append(s.Gather.ToString(ci)).Append(']');
+                      .Append(s.Loot.ToString(ci)).Append(',').Append(s.Craft.ToString(ci)).Append(',').Append(s.Gather.ToString(ci)).Append(',')
+                      .Append(s.PingMs.ToString(ci)).Append(',').Append(s.PacketLoss.ToString(ci)).Append(',')
+                      .Append(s.ClientFps.ToString(ci)).Append(',').Append(s.ClientMemMB.ToString(ci)).Append(']');
                     used.Add(s.Player);
                     written++;
                     last = s.Time;
@@ -2350,7 +3575,7 @@ namespace Oxide.Plugins
             {
                 if (!_enabled) return "Timeline: off";
                 double hours = _rowCount / 3600.0;
-                long bytes = _rows.Length * 72L + _cats.Length * 4L + _samples.Length * 24L;
+                long bytes = _rows.Length * 100L + _cats.Length * 4L + _samples.Length * 32L;
                 return $"Timeline: {_rowCount:n0} second(s) stored ({hours:0.0}h of {_rows.Length / 3600.0:0.0}h), " +
                        $"{_sampleCount:n0} player sample(s), {PlayerIds.Count} player(s) seen, ~{bytes / 1048576.0:0.0}MB reserved; " +
                        $"CSV {(_dir != null ? "writing to " + _dir : "off")}";
