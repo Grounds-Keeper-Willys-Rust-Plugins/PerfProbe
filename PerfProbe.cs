@@ -17,7 +17,7 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.1")]
+    [Info("PerfProbe", "LucienAI", "0.5.2")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
@@ -92,7 +92,7 @@ namespace Oxide.Plugins
             "Buoyancy.Cycle", "BaseMountable.FixedUpdateCycle",
             // Players / network
             "ServerMgr.OnNetworkMessage", "ServerMgr.OnPlayerTick", "BasePlayer.ServerCycle", "BaseMountable.PlayerSyncCycle",
-            "EACServer.DoUpdate", "AntiHack.Cycle", "ConnectionQueue.Cycle", "Facepunch.Network.Raknet.Server.Cycle",
+            "EACServer.DoUpdate", "AntiHack.Cycle", "ConnectionQueue.Cycle", "Network.BaseNetwork.Cycle",
             // NPC AI and navigation
             "AIThinkManager.ProcessQueue", "BasePet.ProcessMovementQueue",
             "Rust.Ai.Gen2.Nav.RustNavigation.Tick", "Rust.Ai.Gen2.RustNavMeshAgent.TickEnabledComponents"
@@ -102,12 +102,12 @@ namespace Oxide.Plugins
         private static readonly string[] WatchAddedInV3 =
         {
             "ServerBuildingManager.Merge", "ServerBuildingManager.Split", "BaseMountable.FixedUpdateCycle",
-            "Facepunch.Network.Raknet.Server.Cycle", "BasePet.ProcessMovementQueue"
+            "Network.BaseNetwork.Cycle", "BasePet.ProcessMovementQueue"
         };
 
         protected override void LoadDefaultConfig()
         {
-            _config = new PluginConfig { ConfigVersion = 3 };
+            _config = new PluginConfig { ConfigVersion = 4 };
             SaveConfig();
         }
 
@@ -140,6 +140,15 @@ namespace Oxide.Plugins
                     if (!_config.WatchOnStartup.Contains(spec))
                         _config.WatchOnStartup.Add(spec);
                 _config.ConfigVersion = 3;
+            }
+
+            // 0.5.2: the network cycle is Network.BaseNetwork.Cycle; 0.5.0/0.5.1 named a Raknet method that does not exist
+            if (_config.ConfigVersion < 4)
+            {
+                int old = _config.WatchOnStartup.IndexOf("Facepunch.Network.Raknet.Server.Cycle");
+                if (old >= 0) _config.WatchOnStartup[old] = "Network.BaseNetwork.Cycle";
+                else if (!_config.WatchOnStartup.Contains("Network.BaseNetwork.Cycle")) _config.WatchOnStartup.Add("Network.BaseNetwork.Cycle");
+                _config.ConfigVersion = 4;
             }
 
             _config.TimelineRetentionMinutes = Mathf.Clamp(_config.TimelineRetentionMinutes, 5, 24 * 60);
@@ -680,7 +689,7 @@ namespace Oxide.Plugins
                 if (key.StartsWith("invoke:", StringComparison.Ordinal)) return Invokes;
                 if (key.StartsWith("rpc:", StringComparison.Ordinal)) return Rpcs;
                 if (key.StartsWith("queue:", StringComparison.Ordinal)) return WorkQueues;
-                if (key.StartsWith("cmd:", StringComparison.Ordinal)) return Console;
+                if (key.StartsWith("cmd:", StringComparison.Ordinal) || key.StartsWith("rcon:", StringComparison.Ordinal)) return Console;
                 if (key.StartsWith("SpawnHandler.", StringComparison.Ordinal) || key.StartsWith("SpawnGroup.", StringComparison.Ordinal) ||
                     key.StartsWith("SpawnPopulationBase.", StringComparison.Ordinal) || key.StartsWith("LootContainer.", StringComparison.Ordinal))
                     return Spawning;
@@ -689,7 +698,7 @@ namespace Oxide.Plugins
                     return Navigation;
                 if (key == "BasePlayer.ServerCycle" || key == "ServerMgr.OnPlayerTick" || key == "ServerMgr.OnNetworkMessage" ||
                     key.StartsWith("ConnectionQueue.", StringComparison.Ordinal) || key.StartsWith("EACServer.", StringComparison.Ordinal) ||
-                    key.StartsWith("AntiHack.", StringComparison.Ordinal) || key == "BaseMountable.PlayerSyncCycle" || key == "Server.Cycle")
+                    key.StartsWith("AntiHack.", StringComparison.Ordinal) || key == "BaseMountable.PlayerSyncCycle" || key == "BaseNetwork.Cycle")
                     return Players;
                 if (key == "ServerMgr.FixedUpdate" || key.StartsWith("Buoyancy.", StringComparison.Ordinal) ||
                     key == "BaseMountable.FixedUpdateCycle") return FixedScripts;
@@ -725,7 +734,11 @@ namespace Oxide.Plugins
             private class Agg { public double TotalMs; public long Calls; public double SpikeMs; public int SpikeHits; public double WorstMs; }
 
             // What each patched method is recorded as
-            private class Target { public string Key; public int Category; }
+            private class Target { public string Key; public int Category; public Dictionary<object, string> InstanceKeys; }
+
+            // 0.5.2: work-queue instances by the static field that holds them ("BaseEntity.globalQueue"), so one patch on a
+            // shared generic runner (PersistentObjectWorkQueue<T>.RunList) can still name the queue it is running
+            private static readonly Dictionary<object, string> InstanceNames = new Dictionary<object, string>();
 
             // Per-frame buckets (reset every frame) and long-running aggregates (reset by perfprobe.reset)
             private static readonly Dictionary<string, Stat> FrameStats = new Dictionary<string, Stat>();
@@ -792,6 +805,7 @@ namespace Oxide.Plugins
                 TimerKeys.Clear();
                 CommandKeys.Clear();
                 CalleeWatched.Clear();
+                InstanceNames.Clear();
                 Touched.Clear();
                 _timerMethod = null;
                 _consoleMethod = null;
@@ -860,6 +874,54 @@ namespace Oxide.Plugins
                 {
                     _depth = 0;
                 }
+            }
+
+            // For instance methods on generic types: one compiled body serves every reference-type instantiation, so the
+            // key comes from the instance (its static field name, else its closed type), not from the patched method
+            public static void InstanceFinalizer(object __instance, MethodBase __originalMethod, CallState __state)
+            {
+                if (__state.Start == 0) return;
+                try
+                {
+                    long elapsed = Pop(__state, out long self);
+                    if (!Active || !Targets.TryGetValue(__originalMethod, out var target)) return;
+                    string key = target.Key;
+                    int category = target.Category;
+                    if (__instance != null)
+                    {
+                        if (target.InstanceKeys == null) target.InstanceKeys = new Dictionary<object, string>();
+                        if (!target.InstanceKeys.TryGetValue(__instance, out key))
+                        {
+                            if (target.InstanceKeys.Count > 500) target.InstanceKeys.Clear();
+                            key = InstanceKey(__instance, __originalMethod.Name);
+                            target.InstanceKeys[__instance] = key;
+                        }
+                        if (key.StartsWith("queue:", StringComparison.Ordinal)) category = Cat.WorkQueues;
+                    }
+                    Record(key, category, elapsed, self);
+                }
+                catch
+                {
+                    _depth = 0;
+                }
+            }
+
+            private static string InstanceKey(object instance, string method)
+            {
+                var type = instance.GetType();
+                string name = InstanceNames.TryGetValue(instance, out var field) ? field : ClosedName(type);
+                bool queue = false;
+                for (var t = type; t != null && !queue; t = t.BaseType) queue = t.Name.IndexOf("WorkQueue", StringComparison.Ordinal) >= 0;
+                return (queue ? "queue:" : string.Empty) + name + "." + method;
+            }
+
+            private static string ClosedName(Type type)
+            {
+                if (!type.IsGenericType) return type.Name;
+                string name = type.Name;
+                int tick = name.IndexOf('`');
+                if (tick > 0) name = name.Substring(0, tick);
+                return name + "<" + string.Join(",", type.GetGenericArguments().Select(a => a.Name)) + ">";
             }
 
             public static void TimerFinalizer(object[] __args, CallState __state)
@@ -994,7 +1056,7 @@ namespace Oxide.Plugins
 
                 string typeName = spec.Substring(0, dot);
                 string methodName = spec.Substring(dot + 1);
-                var type = AccessTools.TypeByName(typeName);
+                var type = FindType(typeName);
                 if (type == null)
                 {
                     message = $"{spec}: type '{typeName}' not found";
@@ -1041,7 +1103,9 @@ namespace Oxide.Plugins
                 try
                 {
                     Targets[target] = new Target { Key = key, Category = category };
-                    Harmony.Patch(target, prefix: Prefix(), finalizer: new HarmonyMethod(typeof(Probe), nameof(TimingFinalizer)));
+                    bool perInstance = !target.IsStatic && target.DeclaringType != null && target.DeclaringType.IsGenericType;
+                    Harmony.Patch(target, prefix: Prefix(),
+                        finalizer: new HarmonyMethod(typeof(Probe), perInstance ? nameof(InstanceFinalizer) : nameof(TimingFinalizer)));
                     Watched.Add(target);
                     return true;
                 }
@@ -1079,7 +1143,80 @@ namespace Oxide.Plugins
                         else { failed++; lastError = error; }
                     }
                 }
-                return $"Timing {_workQueues} work queue(s) (ObjectWorkQueue RunJob)" + (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
+                // 0.5.2: the queues themselves. Every static ObjectWorkQueue / PersistentObjectWorkQueue field is named, and
+                // each runner (RunQueue, RunList) is patched once per generic definition; the per-instance finalizer splits it
+                // by queue. On a 138k-entity server the persistent queues were ~320 ms/s of ServerMgr.Update no watch named.
+                int runners = 0, named = 0;
+                var patchedRunners = new HashSet<string>();
+                foreach (var type in GameTypes())
+                {
+                    FieldInfo[] fields;
+                    try
+                    {
+                        if (type.ContainsGenericParameters) continue;
+                        fields = type.GetFields(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                    }
+                    catch { continue; }
+                    foreach (var field in fields)
+                    {
+                        if (!IsQueueType(field.FieldType)) continue;
+                        object queue;
+                        try { queue = field.GetValue(null); } catch { continue; }
+                        if (queue == null) continue;
+                        if (!InstanceNames.ContainsKey(queue)) { InstanceNames[queue] = $"{type.Name}.{field.Name}"; named++; }
+
+                        foreach (var run in RunnerMethods(queue.GetType()))
+                        {
+                            var owner = run.DeclaringType;
+                            string id = (owner.IsGenericType ? owner.GetGenericTypeDefinition().FullName : owner.FullName) + "." + run.Name;
+                            if (!patchedRunners.Add(id) || Watched.Contains(run)) continue;
+                            if (WatchMethod(run, Describe(run), Cat.WorkQueues, out string error)) runners++;
+                            else { failed++; lastError = error; }
+                        }
+                    }
+                }
+
+                return $"Timing {_workQueues} work queue job runner(s) (RunJob) and {named} named queue(s) through {runners} queue runner(s)" +
+                       (failed > 0 ? $", {failed} failed (last: {lastError})" : string.Empty);
+            }
+
+            private static bool IsQueueType(Type type)
+            {
+                for (var t = type; t != null; t = t.BaseType)
+                    if (t.Name.StartsWith("ObjectWorkQueue", StringComparison.Ordinal) || t.Name.StartsWith("PersistentObjectWorkQueue", StringComparison.Ordinal))
+                        return true;
+                return false;
+            }
+
+            // The most derived RunQueue / RunList with a body
+            private static IEnumerable<MethodInfo> RunnerMethods(Type type)
+            {
+                foreach (var name in new[] { "RunQueue", "RunList" })
+                {
+                    for (var t = type; t != null; t = t.BaseType)
+                    {
+                        var m = t.GetMethods(AllDeclared).FirstOrDefault(x => x.Name == name && !x.IsStatic && IsPatchable(x));
+                        if (m == null) continue;
+                        yield return m;
+                        break;
+                    }
+                }
+            }
+
+            // AccessTools.TypeByName walks every type of every assembly for a short name (~0.9 s on a big server, in one
+            // frame); the game's own assemblies answer most names at once
+            public static Type FindType(string name)
+            {
+                foreach (var asm in new[] { typeof(BaseNetworkable).Assembly, typeof(ConsoleSystem).Assembly, typeof(global::Network.Net).Assembly })
+                {
+                    try
+                    {
+                        var type = asm.GetType(name, false);
+                        if (type != null) return type;
+                    }
+                    catch { }
+                }
+                return AccessTools.TypeByName(name);
             }
 
             public static Type[] GameTypes()
@@ -1102,11 +1239,45 @@ namespace Oxide.Plugins
                     Harmony.Patch(method, prefix: new HarmonyMethod(typeof(Probe), nameof(TimingPrefix)) { priority = AheadOfEverything },
                         finalizer: new HarmonyMethod(typeof(Probe), nameof(ConsoleFinalizer)));
                     _consoleMethod = method;
-                    return "Timing console commands via ConsoleSystem.RunWithResult";
                 }
                 catch (Exception e)
                 {
                     return "Console command timing failed: " + e.Message;
+                }
+
+                // 0.5.2: Carbon runs RCON commands from its own prefix on Facepunch.RCon.OnCommand, so they never reach
+                // RunWithResult; timed there too, as rcon:<command>
+                string rcon = "; RCON commands not timed (Facepunch.RCon.OnCommand not found)";
+                var rconType = AccessTools.TypeByName("Facepunch.RCon");
+                var onCommand = rconType?.GetMethods(AllDeclared).FirstOrDefault(m => m.Name == "OnCommand" && m.GetParameters().Length == 1);
+                if (onCommand != null)
+                {
+                    try
+                    {
+                        Harmony.Patch(onCommand, prefix: new HarmonyMethod(typeof(Probe), nameof(TimingPrefix)) { priority = AheadOfEverything },
+                            finalizer: new HarmonyMethod(typeof(Probe), nameof(RconFinalizer)));
+                        rcon = " and Facepunch.RCon.OnCommand";
+                    }
+                    catch (Exception e)
+                    {
+                        rcon = "; RCON command timing failed: " + e.Message;
+                    }
+                }
+                return "Timing console commands via ConsoleSystem.RunWithResult" + rcon;
+            }
+
+            public static void RconFinalizer(object __0, CallState __state)
+            {
+                if (__state.Start == 0) return;
+                try
+                {
+                    long elapsed = Pop(__state, out long self);
+                    if (!Active) return;
+                    Record("rcon:" + CommandKey(Reflect.Get(__0, "Message") as string).Substring(4), Cat.Console, elapsed, self);
+                }
+                catch
+                {
+                    _depth = 0;
                 }
             }
 
@@ -1150,34 +1321,66 @@ namespace Oxide.Plugins
             {
                 int dot = spec.LastIndexOf('.');
                 if (dot <= 0 || dot == spec.Length - 1) return $"{spec}: use Type.Method";
-                var type = AccessTools.TypeByName(spec.Substring(0, dot));
+                var type = FindType(spec.Substring(0, dot));
                 if (type == null) return $"{spec}: type '{spec.Substring(0, dot)}' not found";
                 string methodName = spec.Substring(dot + 1);
                 var methods = type.GetMethods(AllDeclared).Where(m => m.Name == methodName).ToList();
                 if (methods.Count == 0) return $"{spec}: no method named {methodName}";
 
                 var callees = new List<MethodInfo>();
+                var sources = new Dictionary<string, List<string>>();
                 int skipped = 0;
                 foreach (var method in methods)
                 {
                     List<CodeInstruction> instructions;
                     try { instructions = PatchProcessor.GetOriginalInstructions(method); }
                     catch (Exception e) { return $"{spec}: could not read its IL ({e.Message})"; }
-                    foreach (var ci in instructions)
+                    for (int i = 0; i < instructions.Count; i++)
                     {
-                        if ((ci.opcode != OpCodes.Call && ci.opcode != OpCodes.Callvirt) || !(ci.operand is MethodInfo callee) || callees.Contains(callee)) continue;
+                        var ci = instructions[i];
+                        if ((ci.opcode != OpCodes.Call && ci.opcode != OpCodes.Callvirt) || !(ci.operand is MethodInfo callee)) continue;
+
+                        // A queue-style call usually runs on an instance loaded from a static field a few instructions back
+                        if (!callee.IsStatic && callee.DeclaringType != null)
+                        {
+                            for (int back = i - 1; back >= Math.Max(0, i - 6); back--)
+                            {
+                                if (instructions[back].opcode != OpCodes.Ldsfld || !(instructions[back].operand is FieldInfo field) ||
+                                    !callee.DeclaringType.IsAssignableFrom(field.FieldType)) continue;
+                                string fieldName = $"{field.DeclaringType?.Name}.{field.Name}";
+                                string calleeKey = Describe(callee);
+                                if (!sources.TryGetValue(calleeKey, out var list)) sources[calleeKey] = list = new List<string>();
+                                if (!list.Contains(fieldName)) list.Add(fieldName);
+                                try
+                                {
+                                    var value = field.GetValue(null);
+                                    if (value != null && !InstanceNames.ContainsKey(value)) InstanceNames[value] = fieldName;
+                                }
+                                catch { }
+                                break;
+                            }
+                        }
+
+                        if (callees.Contains(callee)) continue;
                         if (InterestingCallee(callee)) callees.Add(callee);
                         else skipped++;
                     }
                 }
                 if (callees.Count == 0) return $"{spec} calls no patchable game methods ({skipped} framework/accessor calls skipped)";
 
+                // Closed generics (ObjectWorkQueue<A>.RunQueue, ObjectWorkQueue<B>.RunQueue...) share one compiled body for
+                // reference types and one key: keep one of each, with how many it stands for
+                var copies = callees.GroupBy(Describe).ToDictionary(g => g.Key, g => g.Count());
+                callees = callees.GroupBy(Describe).Select(g => g.First()).ToList();
+
                 if (!watch)
                 {
                     var sb = new StringBuilder($"{spec} calls {callees.Count} patchable game method(s) ({skipped} framework/accessor calls skipped); " +
                                                $"'perfprobe.watch callees:{spec}' times them all, 'perfprobe.unwatch callees' stops:\n");
                     foreach (var callee in callees)
-                        sb.Append($"  {Describe(callee)}{(callee.IsVirtual && !callee.IsFinal ? "  [virtual]" : string.Empty)}{(Watched.Contains(callee) ? "  [watched]" : string.Empty)}\n");
+                        sb.Append($"  {Describe(callee)}{(copies[Describe(callee)] > 1 ? $" (x{copies[Describe(callee)]} generic instances)" : string.Empty)}" +
+                                  $"{(callee.IsVirtual && !callee.IsFinal ? "  [virtual]" : string.Empty)}{(Watched.Contains(callee) ? "  [watched]" : string.Empty)}" +
+                                  (sources.TryGetValue(Describe(callee), out var on) ? $"  on {string.Join(", ", on.Take(20))}{(on.Count > 20 ? $" (+{on.Count - 20})" : string.Empty)}" : string.Empty) + "\n");
                     return sb.ToString().TrimEnd();
                 }
 
@@ -1286,7 +1489,7 @@ namespace Oxide.Plugins
 
             public static string FindMethods(string typeName, string filter)
             {
-                var type = AccessTools.TypeByName(typeName);
+                var type = FindType(typeName);
                 if (type == null)
                     return $"Type '{typeName}' not found";
 
@@ -1829,6 +2032,9 @@ namespace Oxide.Plugins
                 if (_loopActive) LoopRestore();
                 _behTimer?.Destroy(); _behTimer = null;
                 if (_behHarmony != null) BehavioursStop(0, false);
+                // the next instance appends to the same day's file: a writer left open made its first write a sharing violation
+                try { _loopWriter?.Dispose(); } catch { }
+                _loopWriter = null;
                 _plugin = null;
             }
 

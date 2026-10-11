@@ -159,7 +159,7 @@ and repeat one level down on the biggest one. `perfprobe.unwatch callees` remove
 
 ### "A command or admin tool freezes the server"
 
-Every console command is timed as `cmd:<name>`, including RCON and client-issued ones, so a slow
+Every console command is timed as `cmd:<name>` and every RCON command as `rcon:<name>`, so a slow
 command shows up in `perfprobe.spikes` and `perfprobe.top` like any other entry.
 
 ### "Garbage collection pauses"
@@ -230,13 +230,13 @@ Every spike is also written to the plugin's log file (`spikes`) in the server's 
 | `LoopSnapshotMinutes` | 5 | How often the player loop is timed for one second and the top systems kept (status, `perfprobe.loop`, loop CSV). 0 turns it off. |
 | `LoopSnapshotTop` | 8 | How many systems each snapshot keeps. |
 | `TrackNetwork` | true | Count packets and bytes sent per message type (`perfprobe.net`) and add network totals to the timeline. |
-| `WatchWorkQueues` | true | Time every `ObjectWorkQueue` job runner in the game (`queue:...`), found automatically. |
-| `TimeConsoleCommands` | true | Time every console command (`cmd:...`), by the command name as typed. |
+| `WatchWorkQueues` | true | Time every work queue in the game (`queue:...`), found automatically: each `ObjectWorkQueue` job runner (`RunJob`), and every queue held in a static field (`ObjectWorkQueue` / `PersistentObjectWorkQueue`), named after that field, e.g. `queue:SomeType.someQueue.RunList`. On a 138k-entity server the persistent queues were a third of the main thread. |
+| `TimeConsoleCommands` | true | Time every console command (`cmd:...`), by the command name as typed, and RCON commands (`rcon:...`, which Carbon runs outside the console system). |
 | `TimeRpcs` | true | Time every server RPC (`rpc:...`, `perfprobe.rpcs`). |
 | `ClientPerfReports` | false | Ask each client for its fps and memory every `PlayerSampleSeconds`. Off by default: it sends every client a small RPC, and it hooks `BasePlayer.PerformanceReport` by IL, which a Rust update can break (it then reports itself unavailable and asks nothing). |
 
 Config version 3 (0.5.0) adds `ServerBuildingManager.Merge/Split`, `BaseMountable.FixedUpdateCycle`,
-`Facepunch.Network.Raknet.Server.Cycle` and `BasePet.ProcessMovementQueue` to `WatchOnStartup`, keeping
+`Network.BaseNetwork.Cycle` and `BasePet.ProcessMovementQueue` to `WatchOnStartup`, keeping
 any entries you added.
 
 ## Overhead and safety
