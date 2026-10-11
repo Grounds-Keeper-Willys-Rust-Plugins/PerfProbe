@@ -8,9 +8,10 @@ that feed a busy engine system. When a frame is slow (a "spike"), it
 records what was running in that frame: game methods, plugin hooks, plugin timers, garbage
 collection, and which entities were spawned or killed. It also keeps a per-second timeline
 of where the server's time went, and can time individual plugins, game methods and entity
-types, so you can see what each one costs. Since 0.5.0 it can also time every entity invoke and
-every server RPC for a short window, counts network traffic per message type, and records each
-player's ping and packet loss (and, optionally, their client fps).
+types, so you can see what each one costs. Since 0.5.0 it can also time every entity invoke for a
+short window, times every server RPC, counts network traffic per message type, records each player's
+ping and packet loss (and, optionally, their client fps), and can split a method's own time into the
+methods it calls.
 
 Everything is read through console commands (server console, F1 console as admin, or RCON).
 
@@ -20,8 +21,9 @@ Everything is read through console commands (server console, F1 console as admin
 2. It loads straight away. The console shows what it is watching, for example
    `Watching 32 method(s)...`, `Timing plugin hooks for 33 plugin(s)` and
    `Timing entity create/spawn/kill per prefab via 4 method(s)`, `Timing 6 work queue(s)`,
-   `Timing console commands via ConsoleSystem.Internal` and
-   `Counting packets sent per message type via NetWrite.PacketID/Send`.
+   `Timing console commands via ConsoleSystem.RunWithResult`,
+   `Counting packets sent per message type via NetWrite.PacketID/Send` and
+   `Timing every server RPC via BaseEntity.SV_RPCMessage`.
 3. Let it run for a while (at least 15–30 minutes, longer for rare spikes), then use the
    commands below.
 
@@ -33,7 +35,7 @@ All commands work from the server console and RCON. In the F1 console they need 
 
 | Command | What it shows |
 |---|---|
-| `perfprobe.status` | Is it running, frames and spikes since the last reset, average fps and worst frame over the last 60 seconds, its own overhead, heap size, scheduler and connection-queue counters, network totals for the last second, whether an invoke/RPC window is running, timeline state. Start here. |
+| `perfprobe.status` | Is it running, frames and spikes since the last reset, average fps and worst frame over the last 60 seconds, its own overhead, heap size, scheduler and connection-queue counters, network totals for the last second, whether an invoke window is running, RPC calls since reset, timeline state. Start here. |
 | `perfprobe.spikes [count]` | The last spike frames (default 10, max 50), one line each: frame time, GC, the 8 most expensive things in that frame, entities spawned and killed, and per-prefab entity time. |
 | `perfprobe.top [count]` | Totals since the last reset: what took the most time inside spike frames, what costs the most per minute overall, and which entities were spawned during spikes. |
 | `perfprobe.spawns [count]` | Entity churn: which prefabs are spawned and killed, per minute. |
@@ -41,13 +43,14 @@ All commands work from the server console and RCON. In the F1 console they need 
 | `perfprobe.loop [seconds] [top]` | Times every Unity player-loop system (physics, navmesh, animation constraints, the script phases...) and prints ms per second and the worst single call for each, with a hint on what to run next for anything busy. With no arguments: the last snapshot (one is taken automatically every `LoopSnapshotMinutes`). **Run this first on a new map or host.** |
 | `perfprobe.behaviours [seconds] [top] [filter]` | Stopwatches every `Update`, `LateUpdate` and `FixedUpdate` declared by any MonoBehaviour (game, framework, plugins), including ones inherited from a generic base such as the game's invoke scheduler, and prints totals per kind (time inside the methods, calls per second, components per frame), the busiest methods and the most called. Compare a kind's total with the matching phase in `perfprobe.loop`: if they match, the phase is fully named. `filter` limits it to type names containing the text. |
 | `perfprobe.invokes [seconds] [top] [filter]` | Times every `Invoke`/`InvokeRepeating` callback for a while (default 30s): ms per second, calls per second, average and worst call, calls over 20 ms, and for each callback the entity prefabs it ran on. Names what `perfprobe.behaviours` can only show as one `InvokeHandlerBase` total. `filter` keeps callbacks whose name contains the text. With no arguments: the last result. |
-| `perfprobe.rpcs [seconds] [top] [filter]` | The same for every server RPC (`[RPC_Server]` methods, the calls clients make: looting, building, using items...). Patches ~1-2 thousand methods, spread over a few seconds at most 8 ms per frame, then times for the window and unpatches. `filter` limits which RPCs are patched, e.g. `perfprobe.rpcs 30 20 Loot`. With no arguments: the last result. |
+| `perfprobe.rpcs [count] [filter]` | Every server RPC (the calls clients make: looting, building, using items, doors...) since the last reset, by RPC name: ms per second, calls per second, average and worst call, and the entity prefabs it was sent to. Always on, through the one method all RPCs pass (`BaseEntity.SV_RPCMessage`). `filter` keeps RPC names containing the text, e.g. `perfprobe.rpcs 20 loot`. |
+| `perfprobe.callees Type.Method` | The game methods a method calls, read from its code. Use it when a method has a large self time (e.g. `ServerMgr.Update`), then `perfprobe.watch callees:Type.Method` to time them all and `perfprobe.unwatch callees` to stop. Virtual calls are marked: watching the base method does not time overrides. |
 | `perfprobe.net [count]` | Packets and bytes sent per network message type (`Entities`, `EntityDestroy`, `RPCMessage`, `Effect`...), counted once per recipient, per second since the last reset and for the last second, plus the engine's own bytes in/out and packet loss. |
 | `perfprobe.clients [count] [ping\|loss\|fps]` | Every online player's ping and packet loss, sorted by the chosen column, with the median ping. With `ClientPerfReports` on, also each client's own fps and memory. |
 | `perfprobe.components <Type> [Type...]` | Counts live Unity components of a type (e.g. `NavMeshObstacle`, `RotationConstraint`): total, enabled, on active objects, carving, and the prefabs and objects that carry them, with a `[collider]` flag. Turns "this engine system is busy" into "these prefabs feed it". 1-40 ms per type on a big map. |
 | `perfprobe.entities [count]` | How many entities of each prefab exist now, player-owned and not. **Loops over every entity in one frame (100–150ms on a big map): avoid while players are on.** |
-| `perfprobe.watch Type.Method` | Start timing a game method, e.g. `perfprobe.watch BaseOven.Cook`. `Type.*` times all methods of a type. |
-| `perfprobe.unwatch Type.Method` | Stop timing it. `Type.*`, any key prefix ending in `*` (e.g. `queue:*`) or `all` also work. |
+| `perfprobe.watch Type.Method` | Start timing a game method, e.g. `perfprobe.watch BaseOven.Cook`. `Type.*` times all methods of a type; `callees:Type.Method` times every game method that method calls (patched over a few frames). |
+| `perfprobe.unwatch Type.Method` | Stop timing it. `Type.*`, any key prefix ending in `*` (e.g. `queue:*`), `callees` (everything added by `watch callees:`) or `all` also work. |
 | `perfprobe.find Type [filter]` | List a type's methods, to find the right name for `watch`, e.g. `perfprobe.find SpawnGroup Spawn`. |
 | `perfprobe.patches` | List Harmony patches other plugins have put on game methods. |
 | `perfprobe.timers [fix\|fixall]` | Find plugin timers that have silently stopped (see below). `fix` restarts lost repeating timers; `fixall` also restarts one-shot timers, which will then fire late. |
@@ -132,9 +135,16 @@ Half of a server frame can sit in Unity engine systems that no plugin profiler s
 
 ### "Players doing something makes the server stutter"
 
-Run `perfprobe.rpcs 30` while it happens (or `perfprobe.rpcs 30 20 <part of a name>` to patch fewer). It
-times every RPC clients send: looting, building, item actions, vending, doors... and names the expensive
-ones and the entities they hit. During the window RPCs also show up in `perfprobe.spikes`.
+Run `perfprobe.rpcs` after it happens (or `perfprobe.reset`, reproduce it, then `perfprobe.rpcs`). Every RPC
+clients send is timed: looting, building, item actions, vending, doors... and the report names the expensive
+ones and the entities they hit. RPCs also show up in `perfprobe.spikes`.
+
+### "A method's own time is large but nothing inside it is named"
+
+`perfprobe.top` shows inclusive time and the timeline's category columns show self time. If, say,
+`ServerMgr.Update` keeps hundreds of ms/s of self time, run `perfprobe.callees ServerMgr.Update` to see what it
+calls, `perfprobe.watch callees:ServerMgr.Update` to time all of them, wait a minute, read `perfprobe.top`,
+and repeat one level down on the biggest one. `perfprobe.unwatch callees` removes them again.
 
 ### "Bandwidth, rubber-banding or players timing out"
 
@@ -221,7 +231,8 @@ Every spike is also written to the plugin's log file (`spikes`) in the server's 
 | `LoopSnapshotTop` | 8 | How many systems each snapshot keeps. |
 | `TrackNetwork` | true | Count packets and bytes sent per message type (`perfprobe.net`) and add network totals to the timeline. |
 | `WatchWorkQueues` | true | Time every `ObjectWorkQueue` job runner in the game (`queue:...`), found automatically. |
-| `TimeConsoleCommands` | true | Time every console command (`cmd:...`). |
+| `TimeConsoleCommands` | true | Time every console command (`cmd:...`), by the command name as typed. |
+| `TimeRpcs` | true | Time every server RPC (`rpc:...`, `perfprobe.rpcs`). |
 | `ClientPerfReports` | false | Ask each client for its fps and memory every `PlayerSampleSeconds`. Off by default: it sends every client a small RPC, and it hooks `BasePlayer.PerformanceReport` by IL, which a Rust update can break (it then reports itself unavailable and asks nothing). |
 
 Config version 3 (0.5.0) adds `ServerBuildingManager.Merge/Split`, `BaseMountable.FixedUpdateCycle`,
@@ -242,10 +253,13 @@ any entries you added.
   unload).
 - The network counters run on every packet send (two small patches, ~0.15us per send); `perfprobe.status`
   shows sends per second and their estimated cost. `TrackNetwork` turns them off.
-- `perfprobe.invokes` and `perfprobe.rpcs` cost the most while they run: every invoke callback or RPC is
-  timed (tens of thousands of calls a second on a big map, roughly 0.3us each). Each report prints its own
-  estimated cost. Outside a window they cost nothing: the patches are removed.
-- `perfprobe.rpcs` patches and unpatches ~1-2 thousand methods, spread over a few seconds at most 8 ms per
-  frame so it never causes a spike itself.
+- `perfprobe.invokes` costs the most while it runs: every invoke callback is timed (~100,000 calls a second
+  on a 138k-entity map, roughly 0.3us each, so ~30 ms/s). The report prints its own estimated cost. Outside the
+  window it costs nothing: the patch is removed.
+- RPC timing is one patch on the RPC dispatcher, ~0.3us per RPC received.
+- Harmony patching costs a few ms per method and allocates memory. Probes that patch many methods
+  (`behaviours`, `watch callees:`) spread it over frames at most 8 ms per frame. 0.5.0's RPC window, which
+  patched 638 methods, cost 60-100 ms frames and a 530 ms garbage collection on an 8.7 GB heap; 0.5.1 replaced
+  it with the single dispatcher patch.
 - Ping, packet loss and the engine network totals are read through reflection once per second and once per
   player sample; if a Rust update renames them, those columns read 0 instead of the plugin failing to load.

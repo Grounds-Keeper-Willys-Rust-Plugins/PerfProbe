@@ -17,8 +17,8 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.0")]
-    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; windowed probes for every entity invoke and server RPC; network traffic by message type and player connection quality.")]
+    [Info("PerfProbe", "LucienAI", "0.5.1")]
+    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
         private const string HarmonyId = "com.lucienmp.perfprobe";
@@ -70,6 +70,9 @@ namespace Oxide.Plugins
 
             // 0.5.0: time every console command, including RCON and client-issued ones (cmd:...)
             public bool TimeConsoleCommands = true;
+
+            // 0.5.1: time every server RPC through BaseEntity.SV_RPCMessage (one patch; perfprobe.rpcs)
+            public bool TimeRpcs = true;
 
             // 0.5.0: ask each client for its fps and memory every PlayerSampleSeconds (perfprobe.clients, player samples).
             // Off by default: it sends every client an RPC and hooks BasePlayer.PerformanceReport by IL, which a Rust update can break.
@@ -197,6 +200,9 @@ namespace Oxide.Plugins
 
             if (_config.TrackNetwork)
                 Puts(NetProbe.Patch(_harmony));
+
+            if (_config.TimeRpcs)
+                Puts(Calls.PatchRpcs(_harmony));
 
             if (_config.ClientPerfReports)
                 Puts(Clients.Patch(this, _harmony, _config.PlayerSampleSeconds));
@@ -344,7 +350,8 @@ namespace Oxide.Plugins
         {
             if (!Allowed(arg)) return;
             string spec = arg.GetString(0, string.Empty);
-            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.watch Type.Method | Type.*" : Probe.Watch(spec));
+            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.watch Type.Method | Type.* | callees:Type.Method" :
+                spec.StartsWith("callees:", StringComparison.OrdinalIgnoreCase) ? Probe.Callees(spec.Substring(8), true) : Probe.Watch(spec));
         }
 
         [ConsoleCommand("perfprobe.unwatch")]
@@ -352,7 +359,7 @@ namespace Oxide.Plugins
         {
             if (!Allowed(arg)) return;
             string spec = arg.GetString(0, string.Empty);
-            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.unwatch Type.Method | Type.* | prefix* (e.g. queue:*) | all" : Probe.Unwatch(spec));
+            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.unwatch Type.Method | Type.* | prefix* (e.g. queue:*) | callees | all" : Probe.Unwatch(spec));
         }
 
         [ConsoleCommand("perfprobe.find")]
@@ -452,14 +459,30 @@ namespace Oxide.Plugins
             arg.ReplyWith(Calls.InvokesStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
         }
 
-        // perfprobe.rpcs [seconds] [top] [filter]: time every [RPC_Server] method for a while (the filter limits which are patched).
-        // No arguments: the last result.
+        // perfprobe.rpcs [count] [filter]: every server RPC since the last reset, by RPC name and the prefab it was sent to
         [ConsoleCommand("perfprobe.rpcs")]
         private void CmdRpcs(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
-            if (!arg.HasArgs(1)) { arg.ReplyWith(Calls.LastReport(false)); return; }
-            arg.ReplyWith(Calls.RpcsStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
+            int count = 30;
+            string filter = string.Empty;
+            for (int i = 0; arg.HasArgs(i + 1); i++)
+            {
+                string value = arg.GetString(i, string.Empty);
+                if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int n)) count = n;
+                else filter = value;
+            }
+            arg.ReplyWith(Calls.RpcReport(count, filter));
+        }
+
+        // perfprobe.callees Type.Method: the game methods a method calls, to drill into its self time with
+        // perfprobe.watch callees:Type.Method
+        [ConsoleCommand("perfprobe.callees")]
+        private void CmdCallees(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            string spec = arg.GetString(0, string.Empty);
+            arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.callees Type.Method  e.g. perfprobe.callees ServerMgr.Update" : Probe.Callees(spec, false));
         }
 
         // perfprobe.net [count]: packets and bytes sent per network message type, plus the engine's own totals
@@ -492,6 +515,7 @@ namespace Oxide.Plugins
             if (!Allowed(arg)) return;
             Probe.Reset();
             NetProbe.Reset();
+            Calls.ResetRpcs();
             arg.ReplyWith("PerfProbe spike, entity and network stats reset (the timeline is kept)");
         }
 
@@ -767,6 +791,7 @@ namespace Oxide.Plugins
                 HookPatchedTypes.Clear();
                 TimerKeys.Clear();
                 CommandKeys.Clear();
+                CalleeWatched.Clear();
                 Touched.Clear();
                 _timerMethod = null;
                 _consoleMethod = null;
@@ -1063,17 +1088,21 @@ namespace Oxide.Plugins
                 catch (ReflectionTypeLoadException e) { return e.Types.Where(t => t != null).ToArray(); }
             }
 
+            // 0.5.1: RunWithResult, the entry every command goes through, with a prefix that runs ahead of all others.
+            // Carbon dispatches its own commands from a prefix on ConsoleSystem; on 0.5.0 that prefix ran before ours
+            // (both at Priority.First, Carbon's patched first) so plugin commands were never timed.
             public static string PatchConsoleCommands()
             {
                 var method = typeof(ConsoleSystem).GetMethods(AllDeclared).FirstOrDefault(m =>
-                    m.Name == "Internal" && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(ConsoleSystem.Arg));
+                    m.Name == "RunWithResult" && m.GetParameters().Length == 3 && m.GetParameters()[1].ParameterType == typeof(string));
                 if (method == null)
-                    return "Console command timing unavailable: ConsoleSystem.Internal(Arg) not found";
+                    return "Console command timing unavailable: ConsoleSystem.RunWithResult(Option, string, object[]) not found";
                 try
                 {
-                    Harmony.Patch(method, prefix: Prefix(), finalizer: new HarmonyMethod(typeof(Probe), nameof(ConsoleFinalizer)));
+                    Harmony.Patch(method, prefix: new HarmonyMethod(typeof(Probe), nameof(TimingPrefix)) { priority = AheadOfEverything },
+                        finalizer: new HarmonyMethod(typeof(Probe), nameof(ConsoleFinalizer)));
                     _consoleMethod = method;
-                    return "Timing console commands via ConsoleSystem.Internal";
+                    return "Timing console commands via ConsoleSystem.RunWithResult";
                 }
                 catch (Exception e)
                 {
@@ -1081,14 +1110,17 @@ namespace Oxide.Plugins
                 }
             }
 
-            public static void ConsoleFinalizer(ConsoleSystem.Arg __0, CallState __state)
+            // Harmony runs higher priorities first; Priority.First is 800
+            private const int AheadOfEverything = 100000;
+
+            public static void ConsoleFinalizer(string __1, CallState __state)
             {
                 if (__state.Start == 0) return;
                 try
                 {
                     long elapsed = Pop(__state, out long self);
                     if (!Active) return;
-                    Record(CommandKey(__0), Cat.Console, elapsed, self);
+                    Record(CommandKey(__1), Cat.Console, elapsed, self);
                 }
                 catch
                 {
@@ -1096,20 +1128,107 @@ namespace Oxide.Plugins
                 }
             }
 
-            private static string CommandKey(ConsoleSystem.Arg arg)
+            // The command name as typed (first word), lower-cased: "perfprobe.status", "c.reload", "inventory.endloot"
+            private static string CommandKey(string command)
             {
-                var cmd = arg?.cmd;
-                if (cmd == null) return "cmd:unknown";
-                if (CommandKeys.TryGetValue(cmd, out var key)) return key;
+                if (string.IsNullOrEmpty(command)) return "cmd:unknown";
+                command = command.TrimStart();
+                int space = command.IndexOf(' ');
+                string name = space < 0 ? command : command.Substring(0, space);
+                if (CommandKeys.TryGetValue(name, out var key)) return key;
                 if (CommandKeys.Count > 5000) CommandKeys.Clear();
-                key = "cmd:" + (cmd.FullName ?? "unknown");
-                CommandKeys[cmd] = key;
+                key = "cmd:" + name.Trim('"').ToLowerInvariant();
+                CommandKeys[name] = key;
                 return key;
+            }
+
+            // 0.5.1: the game methods a method calls, read from its IL, so a large self time can be split one level down.
+            // Virtual calls are listed as the base method: watching it does not time the overrides.
+            private static readonly HashSet<MethodBase> CalleeWatched = new HashSet<MethodBase>();
+
+            public static string Callees(string spec, bool watch)
+            {
+                int dot = spec.LastIndexOf('.');
+                if (dot <= 0 || dot == spec.Length - 1) return $"{spec}: use Type.Method";
+                var type = AccessTools.TypeByName(spec.Substring(0, dot));
+                if (type == null) return $"{spec}: type '{spec.Substring(0, dot)}' not found";
+                string methodName = spec.Substring(dot + 1);
+                var methods = type.GetMethods(AllDeclared).Where(m => m.Name == methodName).ToList();
+                if (methods.Count == 0) return $"{spec}: no method named {methodName}";
+
+                var callees = new List<MethodInfo>();
+                int skipped = 0;
+                foreach (var method in methods)
+                {
+                    List<CodeInstruction> instructions;
+                    try { instructions = PatchProcessor.GetOriginalInstructions(method); }
+                    catch (Exception e) { return $"{spec}: could not read its IL ({e.Message})"; }
+                    foreach (var ci in instructions)
+                    {
+                        if ((ci.opcode != OpCodes.Call && ci.opcode != OpCodes.Callvirt) || !(ci.operand is MethodInfo callee) || callees.Contains(callee)) continue;
+                        if (InterestingCallee(callee)) callees.Add(callee);
+                        else skipped++;
+                    }
+                }
+                if (callees.Count == 0) return $"{spec} calls no patchable game methods ({skipped} framework/accessor calls skipped)";
+
+                if (!watch)
+                {
+                    var sb = new StringBuilder($"{spec} calls {callees.Count} patchable game method(s) ({skipped} framework/accessor calls skipped); " +
+                                               $"'perfprobe.watch callees:{spec}' times them all, 'perfprobe.unwatch callees' stops:\n");
+                    foreach (var callee in callees)
+                        sb.Append($"  {Describe(callee)}{(callee.IsVirtual && !callee.IsFinal ? "  [virtual]" : string.Empty)}{(Watched.Contains(callee) ? "  [watched]" : string.Empty)}\n");
+                    return sb.ToString().TrimEnd();
+                }
+
+                // Patched over several frames (each Harmony patch costs a few ms)
+                var todo = callees.Where(c => !Watched.Contains(c)).ToList();
+                var steps = todo.Select(c => (Action)(() =>
+                {
+                    string key = Describe(c);
+                    if (WatchMethod(c, key, Cat.For(key), out _)) CalleeWatched.Add(c);
+                })).ToList();
+                if (!Calls.Budgeted(steps, () => _instance?.Puts($"[PerfProbe] watching {CalleeWatched.Count} callee(s) of {spec}; see perfprobe.top, 'perfprobe.unwatch callees' to stop")))
+                    return "PerfProbe not initialised";
+                return $"Watching {todo.Count} callee(s) of {spec} ({callees.Count - todo.Count} already watched), patched over the next few frames; " +
+                       "their time shows in perfprobe.top and perfprobe.spikes (inclusive), and comes out of the caller's self time";
+            }
+
+            private static bool InterestingCallee(MethodInfo m)
+            {
+                try
+                {
+                    if (m.IsSpecialName || m.IsGenericMethod || !IsPatchable(m)) return false;
+                    var type = m.DeclaringType;
+                    if (type == null || type == typeof(PerfProbe) || type.FullName.StartsWith("Oxide.Plugins.PerfProbe", StringComparison.Ordinal)) return false;
+                    string assembly = type.Assembly.GetName().Name;
+                    if (assembly == "mscorlib" || assembly == "netstandard" || assembly.StartsWith("System", StringComparison.Ordinal)) return false;
+                    if (type.Name == "TimeWarning" || type.Namespace == "Facepunch" && type.Name == "Pool") return false;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
             }
 
             public static string Unwatch(string spec)
             {
                 bool all = spec == "all";
+                if (spec == "callees")
+                {
+                    int removed = 0;
+                    foreach (var target in CalleeWatched.ToList())
+                    {
+                        try { Harmony.Unpatch(target, HarmonyPatchType.All, HarmonyId); } catch { }
+                        Watched.Remove(target);
+                        Targets.Remove(target);
+                        removed++;
+                    }
+                    CalleeWatched.Clear();
+                    return $"Unwatched {removed} callee(s)";
+                }
+
                 // Type.* or any key prefix ending in * (queue:*, cmd:...)
                 bool wildcard = spec.EndsWith("*");
                 string prefix = wildcard ? spec.Substring(0, spec.Length - 1) : null;
@@ -1898,9 +2017,13 @@ namespace Oxide.Plugins
                 if (_plugin == null) return "PerfProbe not initialised";
                 _beh.Clear(); _behFailed.Clear();
                 _behHarmony = new Harmony(BehHarmonyId);
+                var harmony = _behHarmony;
                 var pre = new HarmonyMethod(typeof(Engine), nameof(BehPrefix));
                 var post = new HarmonyMethod(typeof(Engine), nameof(BehPostfix));
-                int patched = 0, failed = 0, types = 0;
+                // 0.5.1: collected here, patched over several frames (patching ~300 methods in one frame was an 830 ms frame)
+                var work = new List<(MethodInfo Method, BehStat Stat)>();
+                var seen = new HashSet<MethodInfo>();
+                int types = 0;
                 var sw = Stopwatch.StartNew();
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
                 {
@@ -1934,18 +2057,33 @@ namespace Oxide.Plugins
                                     if (inh != null && inh.DeclaringType != null && inh.DeclaringType.IsGenericType && !inh.DeclaringType.IsGenericTypeDefinition)
                                         m = inh.DeclaringType.GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
                                 }
-                                if (m == null || m.IsAbstract || m.GetMethodBody() == null || _beh.ContainsKey(m)) continue;
+                                if (m == null || m.IsAbstract || m.GetMethodBody() == null || !seen.Add(m)) continue;
                             }
                             catch { continue; }
-                            try { _behHarmony.Patch(m, pre, post); _beh[m] = new BehStat { Name = (m.DeclaringType != t ? m.DeclaringType.Name + " via " : string.Empty) + t.FullName + "." + name, Kind = name }; patched++; any = true; }
-                            catch (Exception e) { failed++; if (_behFailed.Count < 20) _behFailed.Add($"{t.FullName}.{name} ({e.GetType().Name}: {e.Message.Split('\n')[0]})"); }
+                            work.Add((m, new BehStat { Name = (m.DeclaringType != t ? m.DeclaringType.Name + " via " : string.Empty) + t.FullName + "." + name, Kind = name }));
+                            any = true;
                         }
                         if (any) types++;
                     }
                 }
-                _behStart = Time.realtimeSinceStartup; _behFrame0 = Time.frameCount;
-                _behTimer = _plugin.timer.Once(seconds, () => BehavioursStop(top, true));
-                return $"Behaviour probe: {patched} methods on {types} MonoBehaviour types patched in {sw.ElapsedMilliseconds}ms ({failed} failed{(_behFailed.Count > 0 ? ": " + string.Join("; ", _behFailed) : string.Empty)}) for {seconds}s; the result prints to the console";
+                int patched = 0, failed = 0;
+                var steps = work.Select(w => (Action)(() =>
+                {
+                    if (_behHarmony != harmony) return;
+                    try { harmony.Patch(w.Method, pre, post); _beh[w.Method] = w.Stat; patched++; }
+                    catch (Exception e) { failed++; if (_behFailed.Count < 20) _behFailed.Add($"{w.Stat.Name} ({e.GetType().Name}: {e.Message.Split('\n')[0]})"); }
+                })).ToList();
+                bool started = Calls.Budgeted(steps, () =>
+                {
+                    if (_behHarmony != harmony || _plugin == null) return;
+                    foreach (var st in _beh.Values) { st.Ticks = st.MaxTicks = 0; st.Calls = st.Over20 = 0; }
+                    _behStart = Time.realtimeSinceStartup; _behFrame0 = Time.frameCount;
+                    _behTimer = _plugin.timer.Once(seconds, () => BehavioursStop(top, true));
+                    _plugin.Puts($"[PerfProbe] behaviour probe: {patched} methods patched ({failed} failed{(_behFailed.Count > 0 ? ": " + string.Join("; ", _behFailed) : string.Empty)}); timing for {seconds}s");
+                });
+                if (!started) { _behHarmony = null; return "PerfProbe not initialised"; }
+                return $"Behaviour probe: found {work.Count} methods on {types} MonoBehaviour types in {sw.ElapsedMilliseconds}ms; patching them over the next few seconds " +
+                       $"(at most 8 ms per frame), then timing for {seconds}s; progress and the result print to the console";
             }
 
             private static void BehPrefix(out long __state) { __state = Stopwatch.GetTimestamp(); }
@@ -1964,8 +2102,16 @@ namespace Oxide.Plugins
             {
                 float secs = Math.Max(0.001f, Time.realtimeSinceStartup - _behStart);
                 _behFrames = Time.frameCount - _behFrame0;
-                try { _behHarmony?.UnpatchAll(BehHarmonyId); } catch (Exception e) { _plugin?.PrintError("Behaviour probe unpatch failed: " + e.Message); }
-                _behHarmony = null; _behTimer = null;
+                _behTimer = null;
+                var harmony = _behHarmony;
+                // Unload: all at once. After a report: over several frames, keeping _behHarmony set until done so a new
+                // run cannot start against half-removed patches
+                if (!report || _plugin == null || !Calls.Budgeted(_beh.Keys.Select(m => (Action)(() => harmony?.Unpatch(m, HarmonyPatchType.All, BehHarmonyId))).ToList(),
+                        () => { if (_behHarmony == harmony) _behHarmony = null; }))
+                {
+                    try { harmony?.UnpatchAll(BehHarmonyId); } catch (Exception e) { _plugin?.PrintError("Behaviour probe unpatch failed: " + e.Message); }
+                    _behHarmony = null;
+                }
                 if (!report || _plugin == null) return;
                 double ms = 1000.0 / Stopwatch.Frequency;
                 var sb = new StringBuilder($"[PerfProbe] script Update/LateUpdate/FixedUpdate over {secs:0}s, {_beh.Count} methods timed:\n");
@@ -2049,12 +2195,12 @@ namespace Oxide.Plugins
 
         #region Call windows
 
-        // 0.5.0. Two kinds of game code are too frequent to time permanently and too many to name in a watch list: entity
-        // invokes (every Invoke/InvokeRepeating callback, run by the invoke scheduler) and server RPCs (every [RPC_Server]
-        // method, ~1-2 thousand of them). Like perfprobe.behaviours they are patched for a window and unpatched after. While
-        // a window records, its calls also feed spikes, top and the timeline through the same self-time stack as everything
-        // else. RPCs are found and patched over several frames (at most PatchBudgetMs per frame) so the probe never makes a
-        // spike of its own.
+        // 0.5.0. Entity invokes (every Invoke/InvokeRepeating callback, run by the invoke scheduler) are too frequent to time
+        // permanently, so like perfprobe.behaviours they are patched for a window and unpatched after; while the window
+        // records, they also feed spikes, top and the timeline through the same self-time stack as everything else.
+        // 0.5.1: server RPCs are timed permanently through their one dispatch point, BaseEntity.SV_RPCMessage. 0.5.0 patched
+        // each [RPC_Server] method (638 on a live server) for a window, which cost 60-100 ms frames while patching and a
+        // 530 ms collection of the ~1 GB Harmony allocated.
         private static class Calls
         {
             private const double PatchBudgetMs = 8;
@@ -2097,7 +2243,37 @@ namespace Oxide.Plugins
             }
 
             private static readonly Window Inv = new Window { Kind = "invokes", Id = HarmonyId + ".invokes", Category = Cat.Invokes };
-            private static readonly Window Rpc = new Window { Kind = "rpcs", Id = HarmonyId + ".rpcs", Category = Cat.Rpcs };
+
+            private static MethodBase _rpcMethod;
+            private static readonly Dictionary<uint, CallStat> RpcStats = new Dictionary<uint, CallStat>();
+            private static float _rpcSince;
+
+            public static bool RpcsActive => _rpcMethod != null;
+
+            // Runs the steps a few per frame (at most PatchBudgetMs of them per frame), then done. False if not initialised.
+            public static bool Budgeted(IList<Action> steps, Action done)
+            {
+                if (_host == null) return false;
+                _host.StartCoroutine(BudgetedRun(steps, done));
+                return true;
+            }
+
+            private static System.Collections.IEnumerator BudgetedRun(IList<Action> steps, Action done)
+            {
+                var sw = Stopwatch.StartNew();
+                foreach (var step in steps)
+                {
+                    if (sw.Elapsed.TotalMilliseconds >= PatchBudgetMs)
+                    {
+                        yield return null;
+                        sw.Restart();
+                    }
+                    try { step(); }
+                    catch (Exception e) { _plugin?.PrintWarning("Patch step failed: " + e.Message); }
+                }
+                try { done?.Invoke(); }
+                catch (Exception e) { _plugin?.PrintWarning("Patch completion failed: " + e.Message); }
+            }
 
             public static void Init(PerfProbe plugin, MonoBehaviour host)
             {
@@ -2107,7 +2283,9 @@ namespace Oxide.Plugins
 
             public static void Shutdown()
             {
-                foreach (var w in new[] { Inv, Rpc })
+                _rpcMethod = null;
+                RpcStats.Clear();
+                foreach (var w in new[] { Inv })
                 {
                     w.Recording = false;
                     w.Timer?.Destroy();
@@ -2138,33 +2316,86 @@ namespace Oxide.Plugins
                        $"(the invoke scheduler is patched for the window); the result prints to the console";
             }
 
-            public static string RpcsStart(int seconds, int top, string filter)
-            {
-                string busy = Busy(Rpc);
-                if (busy != null) return busy;
-                var attr = typeof(BaseEntity).GetNestedType("RPC_Server", BindingFlags.Public | BindingFlags.NonPublic);
-                if (attr == null) return "RPC probe unavailable: BaseEntity.RPC_Server not found";
-                Rpc.Found.Clear();
-                Begin(Rpc, seconds, top, filter, FindRpcs(attr, filter ?? string.Empty));
-                return $"RPC probe: finding and patching every [RPC_Server] method{FilterText(filter)} over the next few seconds " +
-                       $"(at most {PatchBudgetMs:0}ms per frame), then timing for {seconds}s; progress and the result print to the console";
-            }
-
             public static string LastReport(bool invokes)
             {
-                var w = invokes ? Inv : Rpc;
-                string usage = invokes ? "perfprobe.invokes <seconds> [top] [filter]" : "perfprobe.rpcs <seconds> [top] [filter]";
+                var w = Inv;
                 string state = w.State == "idle" ? string.Empty : Busy(w) + "\n";
-                return state + (w.LastReport ?? $"No {w.Kind} result yet. {usage} runs one");
+                return state + (w.LastReport ?? "No invokes result yet. perfprobe.invokes <seconds> [top] [filter] runs one");
             }
 
             public static string StatusLine()
             {
-                string Line(Window w) => w.State == "recording"
-                    ? $"recording, {Math.Max(0, w.Seconds - (Time.realtimeSinceStartup - w.Start)):0}s left"
-                    : w.State;
-                return $"\nCall windows: invokes {Line(Inv)}, rpcs {Line(Rpc)} (perfprobe.invokes / perfprobe.rpcs)";
+                string invokes = Inv.State == "recording"
+                    ? $"recording, {Math.Max(0, Inv.Seconds - (Time.realtimeSinceStartup - Inv.Start)):0}s left"
+                    : Inv.State;
+                string rpcs = RpcsActive ? $"timed ({RpcStats.Values.Sum(s => (long)s.Calls):n0} calls since reset)" : "NOT timed";
+                return $"\nInvoke window: {invokes} (perfprobe.invokes); RPCs {rpcs} (perfprobe.rpcs)";
             }
+
+            #region RPCs
+
+            public static string PatchRpcs(Harmony harmony)
+            {
+                var method = typeof(BaseEntity).GetMethods(AllDeclared).FirstOrDefault(m =>
+                    m.Name == "SV_RPCMessage" && m.GetParameters().Length == 2 && m.GetParameters()[0].ParameterType == typeof(uint));
+                if (method == null) return "RPC timing unavailable: BaseEntity.SV_RPCMessage(uint, Message) not found";
+                try
+                {
+                    harmony.Patch(method, prefix: new HarmonyMethod(typeof(Calls), nameof(RpcPrefix)) { priority = Priority.First },
+                        finalizer: new HarmonyMethod(typeof(Calls), nameof(RpcFinalizer)));
+                }
+                catch (Exception e)
+                {
+                    return "RPC timing failed: " + e.Message;
+                }
+                _rpcMethod = method;
+                _rpcSince = Time.realtimeSinceStartup;
+                return "Timing every server RPC via BaseEntity.SV_RPCMessage";
+            }
+
+            public static void ResetRpcs()
+            {
+                RpcStats.Clear();
+                _rpcSince = Time.realtimeSinceStartup;
+            }
+
+            // Harmony shares __state only between patches declared in the same class, so the prefix lives here too
+            public static void RpcPrefix(out Probe.CallState __state) => Probe.TimingPrefix(out __state);
+
+            public static void RpcFinalizer(BaseEntity __instance, uint __0, Probe.CallState __state)
+            {
+                if (__state.Start == 0) return;
+                try
+                {
+                    long elapsed = Probe.Pop(__state, out long self);
+                    if (!Probe.Active) return;
+                    if (!RpcStats.TryGetValue(__0, out var stat))
+                        RpcStats[__0] = stat = new CallStat { Key = "rpc:" + RpcName(__0) };
+                    Add(stat, elapsed, self, __instance);
+                    Probe.Record(stat.Key, Cat.Rpcs, elapsed, self);
+                }
+                catch
+                {
+                    Probe.ResetDepth();
+                }
+            }
+
+            private static string RpcName(uint id)
+            {
+                try { return StringPool.Get(id) ?? id.ToString(CultureInfo.InvariantCulture); }
+                catch { return id.ToString(CultureInfo.InvariantCulture); }
+            }
+
+            public static string RpcReport(int count, string filter)
+            {
+                if (!RpcsActive) return "RPC timing is off (TimeRpcs in the config) or could not be patched";
+                float secs = Math.Max(1f, Time.realtimeSinceStartup - _rpcSince);
+                var stats = RpcStats.Values.Where(s => s.Calls > 0 &&
+                                                       (filter.Length == 0 || s.Key.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)).ToList();
+                return BuildReport($"server RPCs since reset ({secs / 60f:0.0} min)", stats, secs, Mathf.Clamp(count, 5, 100), filter, Cat.Rpcs, false);
+            }
+
+            #endregion
 
             private static string Busy(Window w)
             {
@@ -2212,9 +2443,7 @@ namespace Oxide.Plugins
                 {
                     w.State = "patching";
                     bool isInvoke = w == Inv;
-                    var prefix = isInvoke ? null : new HarmonyMethod(typeof(Calls), nameof(RpcPrefix)) { priority = Priority.First };
-                    var finalizer = isInvoke ? null : new HarmonyMethod(typeof(Calls), nameof(RpcFinalizer));
-                    var transpiler = isInvoke ? new HarmonyMethod(typeof(Calls), nameof(InvokeTranspiler)) : null;
+                    var transpiler = new HarmonyMethod(typeof(Calls), nameof(InvokeTranspiler));
                     var sw = Stopwatch.StartNew();
                     foreach (var method in w.Found)
                     {
@@ -2225,7 +2454,7 @@ namespace Oxide.Plugins
                         }
                         try
                         {
-                            w.Harmony.Patch(method, prefix, null, transpiler, finalizer);
+                            w.Harmony.Patch(method, transpiler: transpiler);
                             w.Patched.Add(method);
                         }
                         catch (Exception e)
@@ -2393,63 +2622,6 @@ namespace Oxide.Plugins
 
             #endregion
 
-            #region RPCs
-
-            private static System.Collections.IEnumerator FindRpcs(Type attr, string filter)
-            {
-                var sw = Stopwatch.StartNew();
-                foreach (var type in Probe.GameTypes())
-                {
-                    if (sw.Elapsed.TotalMilliseconds >= PatchBudgetMs)
-                    {
-                        yield return null;
-                        sw.Restart();
-                    }
-                    MethodInfo[] methods;
-                    try
-                    {
-                        if (type.ContainsGenericParameters) continue;
-                        methods = type.GetMethods(AllDeclared);
-                    }
-                    catch { continue; }
-                    foreach (var m in methods)
-                    {
-                        bool rpc;
-                        try { rpc = m.IsDefined(attr, false) && Probe.IsPatchable(m); }
-                        catch { continue; }
-                        if (!rpc) continue;
-                        string key = $"rpc:{type.Name}.{m.Name}";
-                        if (filter.Length > 0 && key.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                        Rpc.Found.Add(m);
-                        Rpc.Stats[m] = new CallStat { Key = key };
-                    }
-                }
-            }
-
-            public static void RpcPrefix(out Probe.CallState __state)
-            {
-                if (Rpc.Recording) Probe.TimingPrefix(out __state);
-                else __state = default;
-            }
-
-            public static void RpcFinalizer(MethodBase __originalMethod, object __instance, Probe.CallState __state)
-            {
-                if (__state.Start == 0) return;
-                try
-                {
-                    long elapsed = Probe.Pop(__state, out long self);
-                    if (!Rpc.Recording || !Probe.Active || !Rpc.Stats.TryGetValue(__originalMethod, out var stat)) return;
-                    Add(stat, elapsed, self, __instance);
-                    Probe.Record(stat.Key, Cat.Rpcs, elapsed, self);
-                }
-                catch
-                {
-                    Probe.ResetDepth();
-                }
-            }
-
-            #endregion
-
             private static void Add(CallStat stat, long elapsed, long self, object target)
             {
                 stat.Ticks += elapsed;
@@ -2471,21 +2643,22 @@ namespace Oxide.Plugins
                 p.Calls++;
             }
 
-            private static string BuildReport(Window w, float secs)
+            private static string BuildReport(Window w, float secs) =>
+                BuildReport($"Invoke/InvokeRepeating callbacks over {secs:0}s", w.Stats.Values.Where(s => s.Calls > 0).ToList(), secs, w.Top, w.Filter, w.Category, true);
+
+            private static string BuildReport(string what, List<CallStat> stats, float secs, int top, string filter, int category, bool window)
             {
                 double ms = Probe.TickToMs;
-                var stats = w.Stats.Values.Where(s => s.Calls > 0).ToList();
                 double totalMs = stats.Sum(s => (double)s.Ticks) * ms, selfMs = stats.Sum(s => (double)s.SelfTicks) * ms;
                 double calls = stats.Sum(s => (double)s.Calls);
-                string what = w == Inv ? "Invoke/InvokeRepeating callbacks" : $"server RPCs ({w.Patched.Count} [RPC_Server] methods patched)";
 
                 var sb = new StringBuilder();
-                sb.Append($"[PerfProbe] {what} over {secs:0}s{FilterText(w.Filter)}: {stats.Count} distinct, {calls / secs:n0} calls/s, " +
+                sb.Append($"[PerfProbe] {what}{FilterText(filter)}: {stats.Count} distinct, {calls / secs:n0} calls/s, " +
                           $"{totalMs / secs:F1} ms/s ({selfMs / secs:F1} ms/s self, without timed calls nested inside); " +
                           $"probe cost ~{calls / secs * 0.3 / 1000.0:F1} ms/s\n");
                 if (stats.Count == 0) return sb.Append("  nothing was called").ToString();
 
-                foreach (var s in stats.OrderByDescending(x => x.Ticks).Take(w.Top))
+                foreach (var s in stats.OrderByDescending(x => x.Ticks).Take(top))
                 {
                     sb.Append($"  {s.Ticks * ms / secs,8:F2} ms/s {s.Calls / secs,8:F0}/s  avg {s.Ticks * ms / s.Calls,6:F3} ms  max {s.MaxTicks * ms,6:F1} ms  >20ms {s.Over20,3}  {s.Key}");
                     if (s.SelfTicks < s.Ticks * 0.9) sb.Append($"  (self {s.SelfTicks * ms / secs:F2} ms/s)");
@@ -2497,7 +2670,7 @@ namespace Oxide.Plugins
                 }
 
                 sb.Append("  -- most called:\n");
-                foreach (var s in stats.OrderByDescending(x => x.Calls).Take(Math.Min(w.Top, 12)))
+                foreach (var s in stats.OrderByDescending(x => x.Calls).Take(Math.Min(top, 12)))
                     sb.Append($"  {s.Calls / secs,8:F0}/s  {s.Ticks * ms / secs,8:F2} ms/s  {s.Key}\n");
 
                 var worst = stats.Where(x => x.MaxTicks * ms >= 5).OrderByDescending(x => x.MaxTicks).Take(10).ToList();
@@ -2507,7 +2680,9 @@ namespace Oxide.Plugins
                     foreach (var s in worst)
                         sb.Append($"  max {s.MaxTicks * ms,6:F1} ms  >20ms {s.Over20,3}  {s.Key}\n");
                 }
-                sb.Append($"  (during the window these also fed perfprobe.spikes, perfprobe.top and the timeline's {Cat.Names[w.Category]}_ms column)");
+                sb.Append(window
+                    ? $"  (during the window these also fed perfprobe.spikes, perfprobe.top and the timeline's {Cat.Names[category]}_ms column)"
+                    : $"  (these also feed perfprobe.spikes, perfprobe.top and the timeline's {Cat.Names[category]}_ms column)");
                 return sb.ToString();
             }
         }
