@@ -17,13 +17,16 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.2")]
+    [Info("PerfProbe", "LucienAI", "0.5.3")]
     [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
     public class PerfProbe : RustPlugin
     {
         private const string HarmonyId = "com.lucienmp.perfprobe";
 
         private static PerfProbe _instance;
+
+        // 0.5.3: set by perfprobe.detach; nothing re-patches until the plugin is reloaded
+        private static bool _detached;
         private PluginConfig _config;
         private Harmony _harmony;
         private GameObject _host;
@@ -278,10 +281,33 @@ namespace Oxide.Plugins
 
         private bool Allowed(ConsoleSystem.Arg arg) => arg.Connection == null || arg.IsAdmin;
 
+        private bool Attached(ConsoleSystem.Arg arg)
+        {
+            if (!_detached) return true;
+            arg.ReplyWith("PerfProbe is detached; reload it to attach again");
+            return false;
+        }
+
+        // perfprobe.detach: stop recording and remove every patch a few per frame, so the plugin can then be unloaded or
+        // reloaded without the multi-second freeze of removing ~100 patches in one frame
+        [ConsoleCommand("perfprobe.detach")]
+        private void CmdDetach(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (_detached)
+            {
+                arg.ReplyWith(Detacher.Running ? "PerfProbe is detaching (still removing patches)" : "PerfProbe detached, fast unload can now be performed");
+                return;
+            }
+            _detached = true;
+            arg.ReplyWith(Detacher.Start(this, _harmony));
+        }
+
         [ConsoleCommand("perfprobe.status")]
         private void CmdStatus(ConsoleSystem.Arg arg)
         {
             if (!Allowed(arg)) return;
+            if (_detached) { arg.ReplyWith(Detacher.Running ? "PerfProbe is detaching (still removing patches)" : "PerfProbe detached, fast unload can now be performed"); return; }
             arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
@@ -357,7 +383,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("perfprobe.watch")]
         private void CmdWatch(ConsoleSystem.Arg arg)
         {
-            if (!Allowed(arg)) return;
+            if (!Allowed(arg) || !Attached(arg)) return;
             string spec = arg.GetString(0, string.Empty);
             arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.watch Type.Method | Type.* | callees:Type.Method" :
                 spec.StartsWith("callees:", StringComparison.OrdinalIgnoreCase) ? Probe.Callees(spec.Substring(8), true) : Probe.Watch(spec));
@@ -433,7 +459,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("perfprobe.loop")]
         private void CmdLoop(ConsoleSystem.Arg arg)
         {
-            if (!Allowed(arg)) return;
+            if (!Allowed(arg) || !Attached(arg)) return;
             if (!arg.HasArgs(1)) { arg.ReplyWith(Engine.LastSnapshotText()); return; }
             arg.ReplyWith(Engine.LoopStart(Mathf.Clamp(arg.GetInt(0, 30), 2, 600), arg.GetInt(1, 30), manual: true));
         }
@@ -443,7 +469,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("perfprobe.behaviours")]
         private void CmdBehaviours(ConsoleSystem.Arg arg)
         {
-            if (!Allowed(arg)) return;
+            if (!Allowed(arg) || !Attached(arg)) return;
             arg.ReplyWith(Engine.BehavioursStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
         }
 
@@ -463,7 +489,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("perfprobe.invokes")]
         private void CmdInvokes(ConsoleSystem.Arg arg)
         {
-            if (!Allowed(arg)) return;
+            if (!Allowed(arg) || !Attached(arg)) return;
             if (!arg.HasArgs(1)) { arg.ReplyWith(Calls.LastReport(true)); return; }
             arg.ReplyWith(Calls.InvokesStart(Mathf.Clamp(arg.GetInt(0, 30), 5, 600), arg.GetInt(1, 30), arg.GetString(2, string.Empty)));
         }
@@ -489,7 +515,7 @@ namespace Oxide.Plugins
         [ConsoleCommand("perfprobe.callees")]
         private void CmdCallees(ConsoleSystem.Arg arg)
         {
-            if (!Allowed(arg)) return;
+            if (!Allowed(arg) || !Attached(arg)) return;
             string spec = arg.GetString(0, string.Empty);
             arg.ReplyWith(string.IsNullOrEmpty(spec) ? "Usage: perfprobe.callees Type.Method  e.g. perfprobe.callees ServerMgr.Update" : Probe.Callees(spec, false));
         }
@@ -538,6 +564,7 @@ namespace Oxide.Plugins
 
             private void Update()
             {
+                if (!Probe.Active) return;
                 long now = Stopwatch.GetTimestamp();
                 if (_last != 0)
                 {
@@ -2025,6 +2052,15 @@ namespace Oxide.Plugins
                 }
             }
 
+            // perfprobe.detach: stop timers and restore the player loop; the detacher removes the Harmony patches
+            public static void StopForDetach()
+            {
+                _snapshotTimer?.Destroy(); _snapshotTimer = null;
+                _loopTimer?.Destroy(); _loopTimer = null;
+                if (_loopActive) LoopRestore();
+                _behTimer?.Destroy(); _behTimer = null;
+            }
+
             public static void Shutdown()
             {
                 _snapshotTimer?.Destroy(); _snapshotTimer = null;
@@ -2399,6 +2435,52 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Detach
+
+        // 0.5.3. Unload has to remove every patch at once (the plugin's code is about to go), ~4 s on a big server. Detach
+        // does the same work beforehand, a few patches per frame, so the unload that follows has nothing left to remove.
+        private static class Detacher
+        {
+            public static bool Running;
+
+            public static string Start(PerfProbe plugin, Harmony harmony)
+            {
+                Probe.Active = false;
+                Calls.StopForDetach();
+                Engine.StopForDetach();
+                Clients.Shutdown();
+                Timeline.Shutdown();
+
+                var ids = new HashSet<string> { HarmonyId, HarmonyId + ".invokes", HarmonyId + ".behaviours" };
+                var work = new List<(MethodBase Method, string Id)>();
+                foreach (var method in Harmony.GetAllPatchedMethods().ToList())
+                {
+                    var info = Harmony.GetPatchInfo(method);
+                    if (info == null) continue;
+                    foreach (var owner in info.Owners)
+                        if (ids.Contains(owner)) work.Add((method, owner));
+                }
+
+                var steps = work.Select(w => (Action)(() => harmony.Unpatch(w.Method, HarmonyPatchType.All, w.Id))).ToList();
+                Running = true;
+                bool started = Calls.Budgeted(steps, () =>
+                {
+                    Running = false;
+                    plugin.Puts("PerfProbe detached, fast unload can now be performed");
+                });
+                if (!started)
+                {
+                    foreach (var step in steps) { try { step(); } catch { } }
+                    Running = false;
+                    return "PerfProbe detached, fast unload can now be performed";
+                }
+                return $"Detaching: recording stopped, removing {work.Count} patch(es) over the next few seconds (at most 8 ms per frame); " +
+                       "'PerfProbe detached, fast unload can now be performed' prints when done";
+            }
+        }
+
+        #endregion
+
         #region Call windows
 
         // 0.5.0. Entity invokes (every Invoke/InvokeRepeating callback, run by the invoke scheduler) are too frequent to time
@@ -2485,6 +2567,17 @@ namespace Oxide.Plugins
             {
                 _plugin = plugin;
                 _host = host;
+            }
+
+            // perfprobe.detach: stop the invoke window without unpatching (the detacher removes every patch)
+            public static void StopForDetach()
+            {
+                Inv.Recording = false;
+                Inv.Timer?.Destroy();
+                Inv.Timer = null;
+                try { if (Inv.Job != null && _host != null) _host.StopCoroutine(Inv.Job); } catch { }
+                Inv.Job = null;
+                Inv.State = "idle";
             }
 
             public static void Shutdown()

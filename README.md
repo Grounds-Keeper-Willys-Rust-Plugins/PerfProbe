@@ -58,6 +58,7 @@ All commands work from the server console and RCON. In the F1 console they need 
 | `perfprobe.timeline <from unix time> [rows]` | Per-second timeline as JSON, for graphing. `0` means from the start. |
 | `perfprobe.players <from unix time> [rows]` | Player position and activity samples as JSON, for graphing. |
 | `perfprobe.tp <player> <x> <y> <z>` | Teleport a player from the server console, e.g. to stand somewhere while you measure it. |
+| `perfprobe.detach` | Stops recording and removes every patch PerfProbe made, a few per frame (at most 8 ms per frame), then prints `PerfProbe detached, fast unload can now be performed`. Run it before unloading or reloading PerfProbe on a live server: unloading normally removes ~100 patches in one frame (~4 s freeze on a big server). While detached, commands that would patch again refuse; reload the plugin to attach again. |
 | `perfprobe.reset` | Clear the spike, totals, churn, entity-cost and network stats. The timeline is kept. |
 
 ## Reading the numbers
@@ -245,7 +246,8 @@ any entries you added.
   (well under 0.1% of one core).
 - All timing code is written never to throw inside game code: if a measurement fails, it is
   dropped and the game carries on.
-- Unloading the plugin removes every patch it made.
+- Unloading the plugin removes every patch it made, all in one frame (~4 s on a 138k-entity server with ~100
+  patches). `perfprobe.detach` first removes them over several frames, so the unload is then instant.
 - `perfprobe.entities` and `perfprobe.watch` on very busy methods are the only things that cost
   noticeably; both are opt-in. The loop snapshot adds ~170 stopwatch calls per frame for one second every
   `LoopSnapshotMinutes`. `perfprobe.behaviours` patches a few hundred methods for its window and unpatches
