@@ -64,6 +64,7 @@ All commands work from the server console and RCON. In the F1 console they need 
 | `perfprobe.tp <player> <x> <y> <z>` | Teleport a player from the server console, e.g. to stand somewhere while you measure it. |
 | `perfprobe.attach` | Applies every patch, a few per frame (at most 8 ms per frame), then starts recording with clean stats and prints `PerfProbe attached ... a run can be performed`. `perfprobe.status` says `still patching` until then, and commands that need the patches (`watch`, `invokes`, `behaviours`, `loop`, `callees`) wait for it. Runs automatically on load unless `AttachOnLoad` is off. |
 | `perfprobe.detach` | Stops recording and removes every patch PerfProbe made, a few per frame, then prints `PerfProbe detached, fast unload can now be performed`. Run it before unloading or reloading PerfProbe on a live server: unloading otherwise removes ~100 patches in one frame (~4 s freeze on a big server). `perfprobe.attach` attaches again without a reload. |
+| `perfprobe.logsource "<text>" [minutes]` | Names the code behind a console message that is logged with no stack trace, such as Unity's `Look rotation viewing vector is zero`. For the window (default 30 min) every log line containing the text (case-insensitive) is counted and traced back to the first method outside Unity and the plugin framework, plus the two methods that called it, e.g. `NpcSpawn+AttackState.StateThink`. With no arguments: the sources so far, or the last result. `off` stops it early. The result also prints to the console when the window ends. Works attached or detached. |
 | `perfprobe.reset` | Clear the spike, totals, churn, entity-cost and network stats. The timeline is kept. |
 
 ## Reading the numbers
@@ -162,6 +163,14 @@ and repeat one level down on the biggest one. `perfprobe.unwatch callees` remove
    `spikes`) and the host's network.
 3. With `ClientPerfReports` on, the same list shows each client's own fps. Low client fps with a healthy
    server frame time is client-side lag.
+
+### "Something keeps logging the same message and I can't tell what"
+
+Engine messages such as `Look rotation viewing vector is zero` (some code asked Unity to face along a zero-length
+direction) come with no stack trace, so the console doesn't say which plugin caused them. Run
+`perfprobe.logsource "Look rotation" 60`, wait for the message to come back, then run `perfprobe.logsource`. Each
+source is listed with how many times it logged the message, when it did, and who called it. A source shown as
+`(no managed caller ...)` was logged by the engine on its own, not by game or plugin code.
 
 ### "A command or admin tool freezes the server"
 
@@ -265,6 +274,9 @@ any entries you added.
 - `perfprobe.invokes` costs the most while it runs: every invoke callback is timed (~100,000 calls a second
   on a 138k-entity map, roughly 0.3us each, so ~30 ms/s). The report prints its own estimated cost. Outside the
   window it costs nothing: the patch is removed.
+- `perfprobe.logsource` patches nothing. While it runs, each log line is checked for the text (a string search);
+  only matching lines take a stack trace (~20-50us each), at most 50 a second, and further matches are only counted.
+  Unity's own stack-trace setting is left alone.
 - RPC timing is one patch on the RPC dispatcher, ~0.3us per RPC received.
 - Harmony patching costs a few ms per method and allocates memory. Probes that patch many methods
   (`behaviours`, `watch callees:`) spread it over frames at most 8 ms per frame. 0.5.0's RPC window, which

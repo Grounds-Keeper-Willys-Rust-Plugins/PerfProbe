@@ -17,8 +17,8 @@ using Stopwatch = System.Diagnostics.Stopwatch;
 
 namespace Oxide.Plugins
 {
-    [Info("PerfProbe", "LucienAI", "0.5.6")]
-    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality.")]
+    [Info("PerfProbe", "LucienAI", "0.5.7")]
+    [Description("Server performance probe: records frame spikes and what ran during them, a per-second timeline of where main-thread time went and what players were doing, and engine probes that time Unity's own player-loop systems, every script Update, and count components by prefab; a windowed probe for every entity invoke, every server RPC timed; network traffic by message type and player connection quality; and which code logs a given console message.")]
     public class PerfProbe : RustPlugin
     {
         private const string HarmonyId = "com.lucienmp.perfprobe";
@@ -271,6 +271,7 @@ namespace Oxide.Plugins
 
         private void Unload()
         {
+            LogSource.Shutdown();
             Calls.Shutdown();
             Clients.Shutdown();
             Engine.Shutdown();
@@ -362,7 +363,7 @@ namespace Oxide.Plugins
         {
             if (!Allowed(arg)) return;
             if (_state != State.Attached) { arg.ReplyWith(StateText()); return; }
-            arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
+            arg.ReplyWith(Probe.Status() + "\n" + Live.Status() + Calls.StatusLine() + LogSource.StatusLine() + "\n" + Timeline.Status() + Engine.StatusSuffix());
         }
 
         [ConsoleCommand("perfprobe.spikes")]
@@ -596,6 +597,19 @@ namespace Oxide.Plugins
                 else sort = value.ToLowerInvariant();
             }
             arg.ReplyWith(Clients.Report(count, sort));
+        }
+
+        // perfprobe.logsource "<text>" [minutes]: name the code behind console lines containing the text (they are logged with
+        // no stack trace). No arguments: the sources so far, or the last result. "off": stop and print the result.
+        [ConsoleCommand("perfprobe.logsource")]
+        private void CmdLogSource(ConsoleSystem.Arg arg)
+        {
+            if (!Allowed(arg)) return;
+            if (!arg.HasArgs(1)) { arg.ReplyWith(LogSource.Current()); return; }
+            string filter = arg.GetString(0, string.Empty);
+            if (filter.Equals("off", StringComparison.OrdinalIgnoreCase)) { arg.ReplyWith(LogSource.Stop(true)); return; }
+            if (filter.Trim().Length < 3) { arg.ReplyWith("Usage: perfprobe.logsource \"<text, 3+ characters>\" [minutes]  e.g. perfprobe.logsource \"Look rotation\" 30"); return; }
+            arg.ReplyWith(LogSource.Start(this, filter, Mathf.Clamp(arg.GetInt(1, 30), 1, 24 * 60)));
         }
 
         [ConsoleCommand("perfprobe.reset")]
@@ -3584,6 +3598,189 @@ namespace Oxide.Plugins
                 if (values.Count == 0) return 0;
                 values.Sort();
                 return values[values.Count / 2];
+            }
+        }
+
+        #endregion
+
+        #region Log source
+
+        // 0.5.7. Engine messages such as "Look rotation viewing vector is zero" reach the log with no stack trace, so the
+        // plugin behind them cannot be read off. For a window this listens to Unity's log callback, which runs on the
+        // logging thread before the logging call returns, and takes a managed stack trace for lines containing the filter
+        // text only. Unity's global stack trace setting is left alone, so other log lines cost nothing extra.
+        private static class LogSource
+        {
+            private const string Tag = "[PerfProbe log source]";
+            private const int MaxCapturesPerSecond = 50;
+            private const int MaxGroups = 200;
+            private const int FramesPerKey = 3;
+
+            private class Group
+            {
+                public string Message, Source, Chain;
+                public long Count;
+                public DateTime First, Last;
+            }
+
+            private static readonly object Gate = new object();
+            private static readonly Dictionary<string, Group> Groups = new Dictionary<string, Group>();
+            private static PerfProbe _plugin;
+            private static Timer _timer;
+            private static string _filter, _lastReport;
+            private static DateTime _start, _end;
+            private static long _matches, _uncaptured, _overflow;
+            private static long _second;
+            private static int _capturesThisSecond;
+            private static bool _listening;
+
+            public static string Start(PerfProbe plugin, string filter, int minutes)
+            {
+                Stop(false);
+                lock (Gate)
+                {
+                    Groups.Clear();
+                    _matches = _uncaptured = _overflow = 0;
+                    _capturesThisSecond = 0;
+                    _second = 0;
+                    _filter = filter;
+                    _start = DateTime.UtcNow;
+                    _end = _start.AddMinutes(minutes);
+                }
+                _plugin = plugin;
+                Application.logMessageReceivedThreaded += OnLog;
+                _listening = true;
+                _timer = plugin.timer.Once(minutes * 60f, () => { if (_listening) _plugin?.Puts(Stop(true)); });
+                return $"{Tag} tracing log lines containing \"{filter}\" for {minutes} min; perfprobe.logsource shows the sources so far, " +
+                       "perfprobe.logsource off stops it, and the result prints to the console when the window ends";
+            }
+
+            // Returns the report; the caller prints it
+            public static string Stop(bool report)
+            {
+                if (_listening)
+                {
+                    Application.logMessageReceivedThreaded -= OnLog;
+                    _listening = false;
+                    lock (Gate) _end = DateTime.UtcNow;
+                    _lastReport = Report();
+                }
+                _timer?.Destroy();
+                _timer = null;
+                return report ? (_lastReport ?? $"{Tag} nothing traced yet. perfprobe.logsource \"<text>\" [minutes] starts one") : null;
+            }
+
+            public static void Shutdown()
+            {
+                Stop(false);
+                _plugin = null;
+            }
+
+            public static string Current() =>
+                _listening ? Report() : _lastReport ?? $"{Tag} nothing traced yet. perfprobe.logsource \"<text>\" [minutes] starts one";
+
+            public static string StatusLine() =>
+                _listening ? $"\nLog source: tracing \"{_filter}\", {System.Threading.Interlocked.Read(ref _matches):n0} match(es), " +
+                             $"{Math.Max(0, (_end - DateTime.UtcNow).TotalMinutes):0} min left (perfprobe.logsource)" : string.Empty;
+
+            private static void OnLog(string message, string stackTrace, LogType type)
+            {
+                try
+                {
+                    string filter = _filter;
+                    if (message == null || filter == null || message.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) return;
+                    // Our own replies and console output quote the filter text
+                    if (message.IndexOf("PerfProbe", StringComparison.OrdinalIgnoreCase) >= 0) return;
+
+                    System.Threading.Interlocked.Increment(ref _matches);
+                    long second = DateTime.UtcNow.Ticks / TimeSpan.TicksPerSecond;
+                    lock (Gate)
+                    {
+                        if (second != _second) { _second = second; _capturesThisSecond = 0; }
+                        if (++_capturesThisSecond > MaxCapturesPerSecond) { _uncaptured++; return; }
+                    }
+
+                    var frames = new System.Diagnostics.StackTrace(1, false).GetFrames();
+                    var names = new List<string>(FramesPerKey);
+                    if (frames != null)
+                        foreach (var frame in frames)
+                        {
+                            var method = frame.GetMethod();
+                            var declaring = method?.DeclaringType;
+                            if (declaring == null || IsPlumbing(declaring)) continue;
+                            names.Add(FrameName(declaring, method, frame));
+                            if (names.Count == FramesPerKey) break;
+                        }
+
+                    string text = message.Length > 160 ? message.Substring(0, 160) + "..." : message;
+                    string source = names.Count > 0 ? names[0] : "(no managed caller: logged by the engine itself)";
+                    string chain = names.Count > 1 ? string.Join(" <- ", names.Skip(1)) : string.Empty;
+                    string key = text + "\n" + source + "\n" + chain;
+                    var now = DateTime.UtcNow;
+                    lock (Gate)
+                    {
+                        if (!Groups.TryGetValue(key, out var group))
+                        {
+                            if (Groups.Count >= MaxGroups) { _overflow++; return; }
+                            Groups[key] = group = new Group { Message = text, Source = source, Chain = chain, First = now };
+                        }
+                        group.Count++;
+                        group.Last = now;
+                    }
+                }
+                catch { }
+            }
+
+            // Unity, the runtime, the plugin framework (Puts and friends), the game's log output and this probe: skipped to
+            // reach the code that caused the message
+            private static bool IsPlumbing(Type type)
+            {
+                if (type == typeof(LogSource)) return true;
+                for (var host = typeof(RustPlugin); host != null; host = host.BaseType)
+                    if (type == host) return true;
+                string ns = type.Namespace ?? string.Empty;
+                return ns.StartsWith("UnityEngine", StringComparison.Ordinal) || ns.StartsWith("Unity.", StringComparison.Ordinal) ||
+                       ns.StartsWith("Oxide.Core", StringComparison.Ordinal) || ns.StartsWith("Carbon", StringComparison.Ordinal) && ns != "Carbon.Plugins" ||
+                       ns == "System" || ns.StartsWith("System.", StringComparison.Ordinal) ||
+                       ns.StartsWith("Facepunch", StringComparison.Ordinal) && type.Name.IndexOf("Output", StringComparison.Ordinal) >= 0;
+            }
+
+            private static string FrameName(Type type, MethodBase method, System.Diagnostics.StackFrame frame)
+            {
+                string name = (type.FullName ?? type.Name).Replace("Oxide.Plugins.", string.Empty).Replace("Carbon.Plugins.", string.Empty);
+                int line = frame.GetFileLineNumber();
+                int il = frame.GetILOffset();
+                return $"{name}.{method.Name}" + (line > 0 ? $":{line}" : il >= 0 ? $" @IL_{il:X4}" : string.Empty);
+            }
+
+            private static string Report()
+            {
+                List<Group> groups;
+                long matches, uncaptured, overflow;
+                DateTime start, end;
+                lock (Gate)
+                {
+                    groups = Groups.Values.OrderByDescending(g => g.Count).ToList();
+                    matches = System.Threading.Interlocked.Read(ref _matches);
+                    uncaptured = _uncaptured;
+                    overflow = _overflow;
+                    start = _start;
+                    end = _listening ? DateTime.UtcNow : _end;
+                }
+
+                var sb = new StringBuilder($"{Tag} \"{_filter}\" from {start:HH:mm:ss} to {end:HH:mm:ss} UTC{(_listening ? " (still tracing)" : string.Empty)}: " +
+                                           $"{matches:n0} matching line(s), {groups.Count} source(s)");
+                if (uncaptured > 0) sb.Append($", {uncaptured:n0} counted but not traced (over {MaxCapturesPerSecond} a second)");
+                if (overflow > 0) sb.Append($", {overflow:n0} from sources past the first {MaxGroups}");
+                sb.Append('\n');
+                if (groups.Count == 0) sb.Append("  No matching line yet.\n");
+                foreach (var g in groups)
+                {
+                    sb.Append($"  {g.Count,7:n0}x  {g.Source}  ({g.First:HH:mm:ss}-{g.Last:HH:mm:ss})\n");
+                    if (g.Chain.Length > 0) sb.Append($"           called from {g.Chain}\n");
+                    sb.Append($"           \"{g.Message}\"\n");
+                }
+                return sb.ToString().TrimEnd('\n');
             }
         }
 
